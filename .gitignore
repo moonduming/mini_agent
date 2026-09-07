@@ -1,0 +1,15 @@
+# 本机配置和密钥
+config.ini
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# IDE / OS
+.idea/
+.DS_Store
