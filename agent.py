@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field
 from typing import Annotated, Any
 from uuid import UUID
+from psycopg_pool import ConnectionPool
 
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
@@ -18,7 +19,6 @@ from conversation import (
     insert_messages,
     load_conversation_context,
 )
-from log_ingestion.postgres_writer import get_postgres_connection
 from tools import (
     get_log_error_examples,
     search_knowledge_base,
@@ -49,6 +49,20 @@ agent_tools = [
     search_knowledge_base,
 ]
 model_with_tools = model.bind_tools(agent_tools)
+
+
+database = settings.postgres
+pool = ConnectionPool(
+    min_size=2,
+    max_size=10,
+    kwargs={
+        "host": database.host,
+        "port": database.port,
+        "dbname": database.dbname,
+        "user": database.user,
+        "password": database.password,
+    },
+)
 
 
 @dataclass
@@ -104,22 +118,23 @@ def generate_conversation_summary(
     return str(response.content)
 
 
-def build_agent(connection: Any):
+def build_agent():
     """构建绑定当前数据库连接的 Agent，避免节点依赖 __main__ 全局变量。"""
     tool_node = ToolNode(agent_tools)
 
     def agent_node(state: AgentState):
         response = model_with_tools.invoke(state.messages)
-        insert_messages(
-            [
-                MessageInsertRecord.from_message(
-                    state.conversation_id,
-                    state.turn_id,
-                    response,
-                )
-            ],
-            connection,
-        )
+        with pool.connection() as connection:
+            insert_messages(
+                [
+                    MessageInsertRecord.from_message(
+                        state.conversation_id,
+                        state.turn_id,
+                        response,
+                    )
+                ],
+                connection,
+            )
         return {
             "messages": [response],
             "loop_count": state.loop_count + 1,
@@ -128,17 +143,18 @@ def build_agent(connection: Any):
     def tools_node(state: AgentState):
         result = tool_node.invoke(state)
         tool_messages = result["messages"]
-        insert_messages(
-            [
-                MessageInsertRecord.from_message(
-                    state.conversation_id,
-                    state.turn_id,
-                    message,
-                )
-                for message in tool_messages
-            ],
-            connection,
-        )
+        with pool.connection() as connection:
+            insert_messages(
+                [
+                    MessageInsertRecord.from_message(
+                        state.conversation_id,
+                        state.turn_id,
+                        message,
+                    )
+                    for message in tool_messages
+                ],
+                connection,
+            )
         return {
             "messages": tool_messages,
             "tool_call_count": state.tool_call_count + len(tool_messages),
@@ -164,32 +180,25 @@ def build_agent(connection: Any):
     return graph.compile()
 
 
-def main() -> None:
-    conversation_id = UUID("9b3595d0-8a2d-4d5b-b89e-6e402beedd02")
-    user_id = "akb48"
-    connection = get_postgres_connection()
+app = build_agent()
+
+
+def chat(question: str, conversation_id: UUID, user_id: str) -> str:
 
     try:
-        context = load_conversation_context(
-            connection,
-            conversation_id,
-            user_id,
-        )
-        summary = context.summary
-        summary_until_turn_id = context.summary_until_turn_id
-        turn_id = context.next_turn_id
-        messages: list[BaseMessage] = [
-            build_system_message(summary),
-            *context.recent_messages,
-        ]
-        app = build_agent(connection)
-
-        while True:
-            question = input("你: ").strip()
-            if question.lower() == "exit":
-                break
-            if not question:
-                continue
+        with pool.connection() as connection:
+            context = load_conversation_context(
+                connection,
+                conversation_id,
+                user_id,
+            )
+            summary = context.summary
+            summary_until_turn_id = context.summary_until_turn_id
+            turn_id = context.next_turn_id
+            messages: list[BaseMessage] = [
+                build_system_message(summary),
+                *context.recent_messages,
+            ]
 
             human_message = HumanMessage(content=question)
             messages.append(human_message)
@@ -204,17 +213,16 @@ def main() -> None:
                 connection,
             )
 
-            result = app.invoke(
-                AgentState(
-                    conversation_id=conversation_id,
-                    turn_id=turn_id,
-                    messages=messages,
-                )
+        result = app.invoke(
+            AgentState(
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                messages=messages,
             )
-            print(f"AI: {result['messages'][-1].content}")
-
+        )
+        with pool.connection() as connection:
             # 一轮完整结束后再压缩，避免拆开 AI tool_call 与 ToolMessage。
-            compression = compress_conversation_context(
+            compress_conversation_context(
                 messages=result["messages"],
                 current_summary=summary,
                 summary_until_turn_id=summary_until_turn_id,
@@ -222,16 +230,16 @@ def main() -> None:
                 connection=connection,
                 summary_generator=generate_conversation_summary,
             )
-            summary = compression.summary
-            summary_until_turn_id = compression.summary_until_turn_id
-            messages = [
-                build_system_message(summary),
-                *compression.recent_messages,
-            ]
-            turn_id += 1
-    finally:
-        connection.close()
+
+        return result['messages'][-1].content
+    except Exception as e:
+        print(f"agent执行异常: {e}")
+        return "执行异常"
 
 
 if __name__ == "__main__":
-    main()
+    chat(
+        "你是什么模型",
+         UUID("9b3595d0-8a2d-4d5b-b89e-6e402beedd02"),
+        "akb48"
+    )

@@ -1,0 +1,21 @@
+# Python 3.12
+
+# FastAPI 服务
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+
+# Agent / LLM
+langchain-core==1.6.2
+langchain-openai==1.6.2
+langgraph==1.2.11
+openai==3.10.0
+
+# 数据库与向量检索
+psycopg[binary]==3.3.5
+psycopg-pool==3.3.1
+qdrant-client==1.19.0
+
+# 文档解析与分词
+PyYAML==6.0.3
+transformers==5.17.0
+sentencepiece==0.2.2
