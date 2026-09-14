@@ -4,3 +4,5 @@ docker run -d \
     -p 6334:6334 \
     -v qdrant_storage:/qdrant/storage \
     qdrant/qdrant:latest
+
+uvicorn app.main:app --reload

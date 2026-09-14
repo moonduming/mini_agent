@@ -1,5 +1,6 @@
 """日志分析 Agent：工具循环、消息落库和多轮上下文压缩。"""
-
+import json
+import asyncio
 from dataclasses import dataclass, field
 from typing import Annotated, Any
 from uuid import UUID
@@ -183,7 +184,7 @@ def build_agent():
 app = build_agent()
 
 
-def chat(question: str, conversation_id: UUID, user_id: str) -> str:
+async def chat(question: str, conversation_id: UUID, user_id: str):
 
     try:
         with pool.connection() as connection:
@@ -213,17 +214,27 @@ def chat(question: str, conversation_id: UUID, user_id: str) -> str:
                 connection,
             )
 
-        result = app.invoke(
+        final_state = None
+        async for mode, data in app.astream(
             AgentState(
                 conversation_id=conversation_id,
                 turn_id=turn_id,
                 messages=messages,
-            )
-        )
+            ),
+            stream_mode=["messages", "values"]
+        ):
+            if mode == "messages":
+                message_chunk, metadata = data
+                node = metadata.get("langgraph_node")
+                if node == "agent":
+                    yield "message", message_chunk.content
+            elif mode == "values":
+                final_state = data
+
         with pool.connection() as connection:
             # 一轮完整结束后再压缩，避免拆开 AI tool_call 与 ToolMessage。
             compress_conversation_context(
-                messages=result["messages"],
+                messages=final_state["messages"],
                 current_summary=summary,
                 summary_until_turn_id=summary_until_turn_id,
                 conversation_id=conversation_id,
@@ -231,15 +242,19 @@ def chat(question: str, conversation_id: UUID, user_id: str) -> str:
                 summary_generator=generate_conversation_summary,
             )
 
-        return result['messages'][-1].content
+        yield "done", {}
     except Exception as e:
         print(f"agent执行异常: {e}")
-        return "执行异常"
+        yield "error", {"message": "执行异常"}
 
 
-if __name__ == "__main__":
-    chat(
-        "你是什么模型",
+async def main():
+    async for data in chat(
+        "你不是deepseek v4吗？",
          UUID("9b3595d0-8a2d-4d5b-b89e-6e402beedd02"),
         "akb48"
-    )
+    ):
+        print(data, end="", flush=True)
+
+if __name__ == "__main__":
+    asyncio.run(main())
