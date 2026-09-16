@@ -1,12 +1,15 @@
+import asyncio
 import re
 from datetime import date, datetime, time, timedelta
 from typing import Any
 
-from langchain_core.tools import tool
+from langchain_core.tools import BaseTool, tool
 from qdrant_client import QdrantClient
 from openai import OpenAI
 from config import get_settings
-from log_ingestion.postgres_writer import get_postgres_connection
+from psycopg_pool import AsyncConnectionPool
+
+from database import postgres_pool
 
 
 settings = get_settings()
@@ -30,187 +33,191 @@ qdrant_client = QdrantClient(
 FINGERPRINT_PATTERN = re.compile(r"^[a-f0-9]{64}$")
 
 
-@tool
-def summarize_log_errors(
-    start_at: str | None = None,
-    end_at: str | None = None,
-    log_type: str | None = None,
-    level: str | None = None,
-    limit: int = DEFAULT_SUMMARY_GROUPS,
-) -> dict[str, Any]:
-    """按错误指纹聚合日志，适合先判断是否有错误及主要错误类型。
+def build_tools(pool: AsyncConnectionPool) -> list[BaseTool]:
+    """绑定在线连接池，池不会出现在模型可见的工具参数中。"""
+    @tool
+    async def summarize_log_errors(
+        start_at: str | None = None,
+        end_at: str | None = None,
+        log_type: str | None = None,
+        level: str | None = None,
+        limit: int = DEFAULT_SUMMARY_GROUPS,
+    ) -> dict[str, Any]:
+        """按错误指纹聚合日志，适合先判断是否有错误及主要错误类型。
 
-    默认同时统计 ERROR 和 CRITICAL。不会返回完整 raw_log；如需确认某类
-    错误的上下文，使用 get_log_error_examples 并传入本工具返回的 fingerprint。
+        默认同时统计 ERROR 和 CRITICAL。不会返回完整 raw_log；如需确认某类
+        错误的上下文，使用 get_log_error_examples 并传入本工具返回的 fingerprint。
 
-    Args:
-        start_at: 开始时间，ISO 8601 格式；日期格式表示当天 00:00:00。
-        end_at: 结束时间，ISO 8601 格式；仅传日期时会包含该日期全天。
-        log_type: 可选日志类型，例如 openstack。
-        level: 可选 ERROR 或 CRITICAL；不传时统计两种错误等级。
-        limit: 返回错误分组数，默认 5，最大 10。
-    Returns:
-        包含查询范围、错误总数、错误分组和 has_more 的小型摘要。
-    Notes:
-        查询时间范围最大 7 天
-    """
-    query_start_at, query_end_at = _build_log_time_range(start_at, end_at)
-    query_limit = min(max(limit, 1), MAX_SUMMARY_GROUPS)
+        Args:
+            start_at: 开始时间，ISO 8601 格式；日期格式表示当天 00:00:00。
+            end_at: 结束时间，ISO 8601 格式；仅传日期时会包含该日期全天。
+            log_type: 可选日志类型，例如 openstack。
+            level: 可选 ERROR 或 CRITICAL；不传时统计两种错误等级。
+            limit: 返回错误分组数，默认 5，最大 10。
+        Returns:
+            包含查询范围、错误总数、错误分组和 has_more 的小型摘要。
+        Notes:
+            查询时间范围最大 7 天
+        """
+        query_start_at, query_end_at = _build_log_time_range(start_at, end_at)
+        query_limit = min(max(limit, 1), MAX_SUMMARY_GROUPS)
 
-    conditions = [
-        "occurred_at >= %s",
-        "occurred_at < %s",
-        "is_error = TRUE",
-        "error_fingerprint IS NOT NULL",
-    ]
-    filter_parameters: list[Any] = [query_start_at, query_end_at]
+        conditions = [
+            "occurred_at >= %s",
+            "occurred_at < %s",
+            "is_error = TRUE",
+            "error_fingerprint IS NOT NULL",
+        ]
+        filter_parameters: list[Any] = [query_start_at, query_end_at]
 
-    if log_type:
-        conditions.append("log_type = %s")
-        filter_parameters.append(log_type)
-    if level:
-        normalized_level = level.upper()
-        if normalized_level not in {"ERROR", "CRITICAL"}:
-            raise ValueError("level 只能为 ERROR 或 CRITICAL")
-        conditions.append("level = %s")
-        filter_parameters.append(normalized_level)
+        if log_type:
+            conditions.append("log_type = %s")
+            filter_parameters.append(log_type)
+        if level:
+            normalized_level = level.upper()
+            if normalized_level not in {"ERROR", "CRITICAL"}:
+                raise ValueError("level 只能为 ERROR 或 CRITICAL")
+            conditions.append("level = %s")
+            filter_parameters.append(normalized_level)
 
-    # 多取一组，才能告诉模型是否还有未展示的错误类型。
-    parameters = [*filter_parameters, query_limit + 1]
+        # 多取一组，才能告诉模型是否还有未展示的错误类型。
+        parameters = [*filter_parameters, query_limit + 1]
 
-    sql = f"""
-        WITH grouped_errors AS (
+        sql = f"""
+            WITH grouped_errors AS (
+                SELECT
+                    error_fingerprint,
+                    MIN(log_type) AS log_type,
+                    MIN(logger) AS logger,
+                    MIN(error_kind) AS error_kind,
+                    MIN(error_label) AS error_label,
+                    MIN(error_template) AS error_template,
+                    ARRAY_AGG(DISTINCT level ORDER BY level) AS levels,
+                    COUNT(*) AS error_count,
+                    MIN(occurred_at) AS first_seen,
+                    MAX(occurred_at) AS last_seen
+                FROM logs
+                WHERE {' AND '.join(conditions)}
+                GROUP BY error_fingerprint
+            )
             SELECT
                 error_fingerprint,
-                MIN(log_type) AS log_type,
-                MIN(logger) AS logger,
-                MIN(error_kind) AS error_kind,
-                MIN(error_label) AS error_label,
-                MIN(error_template) AS error_template,
-                ARRAY_AGG(DISTINCT level ORDER BY level) AS levels,
-                COUNT(*) AS error_count,
-                MIN(occurred_at) AS first_seen,
-                MAX(occurred_at) AS last_seen
+                log_type,
+                logger,
+                error_kind,
+                error_label,
+                error_template,
+                levels,
+                error_count,
+                first_seen,
+                last_seen,
+                COUNT(*) OVER () AS total_group_count,
+                COALESCE(SUM(error_count) OVER (), 0) AS total_error_count
+            FROM grouped_errors
+            ORDER BY error_count DESC, last_seen DESC
+            LIMIT %s;
+        """
+
+        async with pool.connection() as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute(sql, parameters)
+                column_names = [column.name for column in cursor.description]
+                rows = [
+                    _serialize_row(dict(zip(column_names, row)))
+                    for row in (await cursor.fetchall())
+                ]
+
+        has_more = len(rows) > query_limit
+        groups = rows[:query_limit]
+        total_group_count = groups[0]["total_group_count"] if groups else 0
+        total_error_count = groups[0]["total_error_count"] if groups else 0
+        for group in groups:
+            group.pop("total_group_count", None)
+            group.pop("total_error_count", None)
+
+        print("调用一次日志错误概览==================")
+        print(f"start_at: {query_start_at}, end_at: {query_end_at}, log_type: {log_type}, level: {level}, limit: {query_limit}")
+        return {
+            "query": {
+                "start_at": query_start_at.isoformat(),
+                "end_at_exclusive": query_end_at.isoformat(),
+                "log_type": log_type,
+                "level": level.upper() if level else None,
+            },
+            "total_error_count": total_error_count,
+            "total_group_count": total_group_count,
+            "groups": groups,
+            "has_more": has_more,
+        }
+
+
+    @tool
+    async def get_log_error_examples(
+        fingerprint: str,
+        limit: int = DEFAULT_DETAIL_LOGS,
+    ) -> dict[str, Any]:
+        """获取一个错误指纹的少量代表日志，用于确认错误上下文。
+
+        只能使用 summarize_log_errors 返回的 fingerprint。为控制上下文大小，
+        最多返回 3 条日志，并且每条 raw_log 只保留前 1,500 个字符。
+
+        Args:
+            fingerprint: summarize_log_errors 返回的 64 位错误指纹。
+            limit: 返回日志条数，默认且最大为 3。
+        Returns:
+            包含代表日志、has_more 及原始日志是否被截断的信息。
+        """
+        normalized_fingerprint = fingerprint.strip().lower()
+        if not FINGERPRINT_PATTERN.fullmatch(normalized_fingerprint):
+            raise ValueError("fingerprint 必须是摘要工具返回的 64 位十六进制字符串")
+
+        query_limit = min(max(limit, 1), MAX_DETAIL_LOGS)
+        sql = """
+            SELECT
+                id,
+                log_type,
+                occurred_at,
+                level,
+                logger,
+                error_kind,
+                error_label,
+                error_template,
+                LEFT(COALESCE(message, ''), %s) AS message_excerpt,
+                LEFT(raw_log, %s) AS raw_log_excerpt,
+                CHAR_LENGTH(raw_log) > %s AS raw_log_truncated
             FROM logs
-            WHERE {' AND '.join(conditions)}
-            GROUP BY error_fingerprint
-        )
-        SELECT
-            error_fingerprint,
-            log_type,
-            logger,
-            error_kind,
-            error_label,
-            error_template,
-            levels,
-            error_count,
-            first_seen,
-            last_seen,
-            COUNT(*) OVER () AS total_group_count,
-            COALESCE(SUM(error_count) OVER (), 0) AS total_error_count
-        FROM grouped_errors
-        ORDER BY error_count DESC, last_seen DESC
-        LIMIT %s;
-    """
+            WHERE is_error = TRUE
+              AND error_fingerprint = %s
+            ORDER BY occurred_at DESC
+            LIMIT %s;
+        """
+        parameters = [
+            MAX_SUMMARY_EXCERPT_CHARS,
+            MAX_LOG_EXCERPT_CHARS,
+            MAX_LOG_EXCERPT_CHARS,
+            normalized_fingerprint,
+            query_limit + 1,
+        ]
 
-    with get_postgres_connection() as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(sql, parameters)
-            column_names = [column.name for column in cursor.description]
-            rows = [
-                _serialize_row(dict(zip(column_names, row)))
-                for row in cursor.fetchall()
-            ]
+        async with pool.connection() as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute(sql, parameters)
+                column_names = [column.name for column in cursor.description]
+                rows = [
+                    _serialize_row(dict(zip(column_names, row)))
+                    for row in (await cursor.fetchall())
+                ]
 
-    has_more = len(rows) > query_limit
-    groups = rows[:query_limit]
-    total_group_count = groups[0]["total_group_count"] if groups else 0
-    total_error_count = groups[0]["total_error_count"] if groups else 0
-    for group in groups:
-        group.pop("total_group_count", None)
-        group.pop("total_error_count", None)
+        print("调用一次日志详情获取--------------")
+        print(f"fingerprint: {normalized_fingerprint}, limit: {query_limit}")
+        return {
+            "fingerprint": normalized_fingerprint,
+            "examples": rows[:query_limit],
+            "has_more": len(rows) > query_limit,
+            "max_raw_log_chars": MAX_LOG_EXCERPT_CHARS,
+        }
 
-    print("调用一次日志错误概览==================")
-    print(f"start_at: {query_start_at}, end_at: {query_end_at}, log_type: {log_type}, level: {level}, limit: {query_limit}")
-    return {
-        "query": {
-            "start_at": query_start_at.isoformat(),
-            "end_at_exclusive": query_end_at.isoformat(),
-            "log_type": log_type,
-            "level": level.upper() if level else None,
-        },
-        "total_error_count": total_error_count,
-        "total_group_count": total_group_count,
-        "groups": groups,
-        "has_more": has_more,
-    }
-
-
-@tool
-def get_log_error_examples(
-    fingerprint: str,
-    limit: int = DEFAULT_DETAIL_LOGS,
-) -> dict[str, Any]:
-    """获取一个错误指纹的少量代表日志，用于确认错误上下文。
-
-    只能使用 summarize_log_errors 返回的 fingerprint。为控制上下文大小，
-    最多返回 3 条日志，并且每条 raw_log 只保留前 1,500 个字符。
-
-    Args:
-        fingerprint: summarize_log_errors 返回的 64 位错误指纹。
-        limit: 返回日志条数，默认且最大为 3。
-    Returns:
-        包含代表日志、has_more 及原始日志是否被截断的信息。
-    """
-    normalized_fingerprint = fingerprint.strip().lower()
-    if not FINGERPRINT_PATTERN.fullmatch(normalized_fingerprint):
-        raise ValueError("fingerprint 必须是摘要工具返回的 64 位十六进制字符串")
-
-    query_limit = min(max(limit, 1), MAX_DETAIL_LOGS)
-    sql = """
-        SELECT
-            id,
-            log_type,
-            occurred_at,
-            level,
-            logger,
-            error_kind,
-            error_label,
-            error_template,
-            LEFT(COALESCE(message, ''), %s) AS message_excerpt,
-            LEFT(raw_log, %s) AS raw_log_excerpt,
-            CHAR_LENGTH(raw_log) > %s AS raw_log_truncated
-        FROM logs
-        WHERE is_error = TRUE
-          AND error_fingerprint = %s
-        ORDER BY occurred_at DESC
-        LIMIT %s;
-    """
-    parameters = [
-        MAX_SUMMARY_EXCERPT_CHARS,
-        MAX_LOG_EXCERPT_CHARS,
-        MAX_LOG_EXCERPT_CHARS,
-        normalized_fingerprint,
-        query_limit + 1,
-    ]
-
-    with get_postgres_connection() as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(sql, parameters)
-            column_names = [column.name for column in cursor.description]
-            rows = [
-                _serialize_row(dict(zip(column_names, row)))
-                for row in cursor.fetchall()
-            ]
-
-    print("调用一次日志详情获取--------------")
-    print(f"fingerprint: {normalized_fingerprint}, limit: {query_limit}")
-    return {
-        "fingerprint": normalized_fingerprint,
-        "examples": rows[:query_limit],
-        "has_more": len(rows) > query_limit,
-        "max_raw_log_chars": MAX_LOG_EXCERPT_CHARS,
-    }
+    return [summarize_log_errors, get_log_error_examples, search_knowledge_base]
 
 
 def _serialize_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -290,10 +297,18 @@ def search_knowledge_base(query: str) -> list[dict]:
     return [point.model_dump() for point in search_result.points]
 
 
-if "__main__" == __name__:
-   query = summarize_log_errors.invoke({
-        "start_at": "2017-05-14",
-        "end_at": "2017-05-16",
-    })
-   for group in query['groups']:
-       print(get_log_error_examples.invoke(group['error_fingerprint']))
+async def main():
+    async with postgres_pool() as pool:
+        summarize_log_errors, get_log_error_examples, _ = build_tools(pool)
+        query = await summarize_log_errors.ainvoke({
+            "start_at": "2017-05-14",
+            "end_at": "2017-05-16",
+        })
+        for group in query["groups"]:
+            print(await get_log_error_examples.ainvoke({
+                "fingerprint": group["error_fingerprint"],
+            }))
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

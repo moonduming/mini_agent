@@ -127,6 +127,7 @@
     }
 
     .message.error { border-color: #7c3340; color: #ffd6da; }
+    .request-progress { padding: 0 22px 14px; color: var(--muted); font-size: 13px; }
 
     .composer {
       padding: 16px;
@@ -202,7 +203,7 @@
         <h1>Mini Agent 调试台</h1>
         <p>通过 POST 请求读取 SSE，实时查看模型输出和原始事件。</p>
       </div>
-      <div id="status" class="status"><span class="dot"></span><span>就绪</span></div>
+      <div id="status" class="status" role="status"><span class="dot"></span><span>就绪</span></div>
     </header>
 
     <div class="layout">
@@ -210,8 +211,9 @@
         <div id="messages" class="messages">
           <div id="empty" class="empty">输入问题后点击“发送”<br>响应会随着 SSE 消息实时显示</div>
         </div>
+        <div id="progress" class="request-progress" role="status">等待发送请求</div>
         <div class="composer">
-          <textarea id="question" placeholder="例如：分析 2017-05-15 到 2017-05-17 的 ERROR 日志"></textarea>
+          <textarea id="question" aria-label="问题" placeholder="例如：分析 2017-05-15 到 2017-05-17 的 ERROR 日志"></textarea>
           <div class="actions">
             <button id="stop" class="danger" disabled>停止</button>
             <button id="send">发送</button>
@@ -237,7 +239,7 @@
 
         <label>原始 SSE 事件</label>
         <div id="eventLog" class="event-log">等待请求……</div>
-        <div class="hint">快捷键：Ctrl / Cmd + Enter 发送。停止按钮只中断浏览器连接。</div>
+        <div class="hint">快捷键：Ctrl / Cmd + Enter 发送。停止按钮只中断浏览器连接。清空页面不会删除数据库中的会话；新建会话会更换会话 ID。</div>
       </aside>
     </div>
   </main>
@@ -252,6 +254,7 @@
       conversationId: document.querySelector('#conversationId'),
       eventLog: document.querySelector('#eventLog'),
       status: document.querySelector('#status'),
+      progress: document.querySelector('#progress'),
       send: document.querySelector('#send'),
       stop: document.querySelector('#stop'),
       clear: document.querySelector('#clear'),
@@ -275,7 +278,7 @@
     }
 
     function appendMessage(role, text = '') {
-      elements.empty?.remove();
+      elements.messages.querySelector('.empty')?.remove();
       const message = document.createElement('div');
       message.className = `message ${role}`;
       message.textContent = text;
@@ -303,10 +306,13 @@
       let eventName = 'message';
       const dataLines = [];
       for (const line of block.split('\n')) {
+        if (line.startsWith(':')) continue;
         if (line.startsWith('event:')) eventName = line.slice(6).trim();
-        if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart());
+        if (line === 'data') dataLines.push('');
+        if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^ /, ''));
       }
 
+      if (!dataLines.length) return null;
       const rawData = dataLines.join('\n');
       if (!rawData) return { eventName, data: null };
       try {
@@ -314,6 +320,14 @@
       } catch {
         return { eventName, data: rawData };
       }
+    }
+
+    function setRequestActive(active) {
+      for (const element of [elements.send, elements.clear, elements.newConversation,
+        elements.endpoint, elements.userId, elements.conversationId]) {
+        element.disabled = active;
+      }
+      elements.stop.disabled = !active;
     }
 
     async function sendMessage() {
@@ -326,16 +340,51 @@
         setStatus('请填写用户 ID 和会话 ID');
         return;
       }
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(conversationId)) {
+        setStatus('会话 ID 必须是有效的 UUID');
+        return;
+      }
 
+      setConversationId(conversationId);
       localStorage.setItem('mini-agent-user-id', userId);
       appendMessage('user', question);
       const assistantMessage = appendMessage('assistant');
       elements.question.value = '';
       elements.eventLog.textContent = '';
-      elements.send.disabled = true;
-      elements.stop.disabled = false;
+      setRequestActive(true);
       abortController = new AbortController();
-      setStatus('接收中', true);
+      setStatus('连接中', true);
+      elements.progress.textContent = '正在连接接口……';
+      let terminalEvent = null;
+      let reader = null;
+
+      function handleEvent(block) {
+        const parsed = parseEventBlock(block);
+        if (!parsed) return;
+        const { eventName, data } = parsed;
+        appendEvent(eventName, data);
+        if (terminalEvent) return;
+
+        if (eventName === 'status') {
+          elements.progress.textContent = contentAsText(data);
+          setStatus('工具执行中', true);
+        } else if (eventName === 'message') {
+          assistantMessage.textContent += contentAsText(data);
+          elements.messages.scrollTop = elements.messages.scrollHeight;
+          elements.progress.textContent = '正在接收回答，等待服务端完成本轮处理……';
+          setStatus('接收中', true);
+        } else if (eventName === 'error') {
+          terminalEvent = 'error';
+          const message = data?.message || contentAsText(data) || '接口执行异常';
+          appendMessage('assistant error', message);
+          elements.progress.textContent = message;
+          setStatus('执行失败');
+        } else if (eventName === 'done') {
+          terminalEvent = 'done';
+          elements.progress.textContent = '本轮处理完成';
+          setStatus('完成');
+        }
+      }
 
       try {
         const response = await fetch(elements.endpoint.value.trim() || '/chat', {
@@ -355,9 +404,14 @@
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}: ${await response.text()}`);
         }
+        if (!response.headers.get('content-type')?.includes('text/event-stream')) {
+          throw new Error('接口未返回 SSE，请检查接口地址');
+        }
         if (!response.body) throw new Error('浏览器没有收到响应流');
 
-        const reader = response.body.getReader();
+        reader = response.body.getReader();
+        setStatus('等待响应', true);
+        elements.progress.textContent = '已连接，等待模型或工具返回……';
         const decoder = new TextDecoder();
         let buffer = '';
 
@@ -370,42 +424,37 @@
           while ((boundary = buffer.indexOf('\n\n')) !== -1) {
             const block = buffer.slice(0, boundary);
             buffer = buffer.slice(boundary + 2);
-            if (!block.trim() || block.startsWith(':')) continue;
-
-            const { eventName, data } = parseEventBlock(block);
-            appendEvent(eventName, data);
-
-            if (eventName === 'message') {
-              assistantMessage.textContent += contentAsText(data);
-              elements.messages.scrollTop = elements.messages.scrollHeight;
-            } else if (eventName === 'error') {
-              assistantMessage.classList.add('error');
-              assistantMessage.textContent ||= data?.message || '接口执行异常';
-              setStatus('执行失败');
-            } else if (eventName === 'done') {
-              setStatus('完成');
-            }
+            handleEvent(block);
           }
 
+          if (terminalEvent) {
+            await reader.cancel();
+            break;
+          }
           if (done) break;
         }
 
-        if (!assistantMessage.textContent) assistantMessage.textContent = '未收到文本内容';
-        if (elements.status.classList.contains('streaming')) setStatus('连接结束');
+        if (!terminalEvent) throw new Error('连接已结束，但未收到 done 或 error 事件，本轮可能未完成');
+        if (!assistantMessage.textContent) {
+          if (terminalEvent === 'error') assistantMessage.remove();
+          else assistantMessage.textContent = '本轮已完成，未返回文本内容';
+        }
       } catch (error) {
         if (error.name === 'AbortError') {
           assistantMessage.textContent ||= '已停止接收';
+          elements.progress.textContent = '浏览器已停止接收，本轮服务端状态未确认';
           setStatus('已停止');
         } else {
-          assistantMessage.classList.add('error');
-          assistantMessage.textContent ||= String(error);
+          if (!assistantMessage.textContent) assistantMessage.remove();
+          appendMessage('assistant error', String(error));
+          elements.progress.textContent = String(error);
           appendEvent('client_error', String(error));
           setStatus('连接失败');
         }
       } finally {
+        reader?.releaseLock();
         abortController = null;
-        elements.send.disabled = false;
-        elements.stop.disabled = true;
+        setRequestActive(false);
         elements.question.focus();
       }
     }
@@ -422,6 +471,8 @@
       empty.textContent = '页面已清空，会话 ID 保持不变';
       elements.messages.appendChild(empty);
       elements.eventLog.textContent = '等待请求……';
+      elements.progress.textContent = '等待发送请求';
+      setStatus('就绪');
     });
     elements.newConversation.addEventListener('click', () => {
       setConversationId(createConversationId());
@@ -431,6 +482,8 @@
       empty.textContent = '已创建新会话';
       elements.messages.appendChild(empty);
       elements.eventLog.textContent = '等待请求……';
+      elements.progress.textContent = '等待发送请求';
+      setStatus('就绪');
     });
 
     elements.userId.value = localStorage.getItem('mini-agent-user-id') || 'debug-user';

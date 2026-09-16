@@ -1,14 +1,14 @@
 """日志分析 Agent：工具循环、消息落库和多轮上下文压缩。"""
-import json
 import asyncio
 from dataclasses import dataclass, field
 from typing import Annotated, Any
 from uuid import UUID
-from psycopg_pool import ConnectionPool
+from psycopg_pool import AsyncConnectionPool
 
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
+from langgraph.graph.state import CompiledStateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 
@@ -20,11 +20,8 @@ from conversation import (
     insert_messages,
     load_conversation_context,
 )
-from tools import (
-    get_log_error_examples,
-    search_knowledge_base,
-    summarize_log_errors,
-)
+from database import postgres_pool
+from tools import build_tools
 
 
 BASE_SYSTEM_PROMPT = """你是一个日志分析助手，会使用工具，不要编造不存在的日志。
@@ -36,33 +33,19 @@ SUMMARY_SYSTEM_PROMPT = """你负责维护多轮日志分析对话的累计摘�
 用户约束和待解决问题。删除寒暄、重复内容和冗长原始日志。不要补充对话中没有的事实。
 输出一份可供后续对话直接使用的简洁摘要，不超过 1200 个中文字符。"""
 
+
+TOOL_STATUS = {
+    "get_log_error_examples": "获取日志错误详情",
+    "search_knowledge_base": "搜索知识库",
+    "summarize_log_errors": "获取错误日志摘要"
+}
+
 settings = get_settings()
 model = ChatOpenAI(
     model=settings.llm.chat_model,
     api_key=settings.llm.api_key,
     base_url=settings.llm.base_url,
     temperature=0,
-)
-
-agent_tools = [
-    summarize_log_errors,
-    get_log_error_examples,
-    search_knowledge_base,
-]
-model_with_tools = model.bind_tools(agent_tools)
-
-
-database = settings.postgres
-pool = ConnectionPool(
-    min_size=2,
-    max_size=10,
-    kwargs={
-        "host": database.host,
-        "port": database.port,
-        "dbname": database.dbname,
-        "user": database.user,
-        "password": database.password,
-    },
 )
 
 
@@ -98,14 +81,14 @@ def build_system_message(summary: str | None) -> SystemMessage:
     )
 
 
-def generate_conversation_summary(
+async def generate_conversation_summary(
     previous_summary: str | None,
     messages: list[BaseMessage],
 ) -> str:
     """使用不绑定工具的模型更新累计摘要，避免摘要过程中调用业务工具。"""
     previous = previous_summary or "（暂无历史摘要）"
     transcript = format_messages_for_summary(messages)
-    response = model.invoke(
+    response = await model.ainvoke(
         [
             SystemMessage(content=SUMMARY_SYSTEM_PROMPT),
             HumanMessage(
@@ -119,14 +102,16 @@ def generate_conversation_summary(
     return str(response.content)
 
 
-def build_agent():
-    """构建绑定当前数据库连接的 Agent，避免节点依赖 __main__ 全局变量。"""
+def build_agent(pool: AsyncConnectionPool) -> CompiledStateGraph:
+    """构建使用指定连接池的 Agent；池的生命周期由运行入口管理。"""
+    agent_tools = build_tools(pool)
+    model_with_tools = model.bind_tools(agent_tools)
     tool_node = ToolNode(agent_tools)
 
-    def agent_node(state: AgentState):
-        response = model_with_tools.invoke(state.messages)
-        with pool.connection() as connection:
-            insert_messages(
+    async def agent_node(state: AgentState):
+        response = await model_with_tools.ainvoke(state.messages)
+        async with pool.connection() as connection:
+            await insert_messages(
                 [
                     MessageInsertRecord.from_message(
                         state.conversation_id,
@@ -141,11 +126,11 @@ def build_agent():
             "loop_count": state.loop_count + 1,
         }
 
-    def tools_node(state: AgentState):
-        result = tool_node.invoke(state)
+    async def tools_node(state: AgentState):
+        result = await tool_node.ainvoke(state)
         tool_messages = result["messages"]
-        with pool.connection() as connection:
-            insert_messages(
+        async with pool.connection() as connection:
+            await insert_messages(
                 [
                     MessageInsertRecord.from_message(
                         state.conversation_id,
@@ -181,14 +166,17 @@ def build_agent():
     return graph.compile()
 
 
-app = build_agent()
-
-
-async def chat(question: str, conversation_id: UUID, user_id: str):
-
+async def chat(
+    question: str,
+    conversation_id: UUID,
+    user_id: str,
+    *,
+    pool: AsyncConnectionPool,
+    graph: CompiledStateGraph,
+):
     try:
-        with pool.connection() as connection:
-            context = load_conversation_context(
+        async with pool.connection() as connection:
+            context = await load_conversation_context(
                 connection,
                 conversation_id,
                 user_id,
@@ -203,7 +191,7 @@ async def chat(question: str, conversation_id: UUID, user_id: str):
 
             human_message = HumanMessage(content=question)
             messages.append(human_message)
-            insert_messages(
+            await insert_messages(
                 [
                     MessageInsertRecord.from_message(
                         conversation_id,
@@ -215,32 +203,39 @@ async def chat(question: str, conversation_id: UUID, user_id: str):
             )
 
         final_state = None
-        async for mode, data in app.astream(
+        async for event in graph.astream_events(
             AgentState(
                 conversation_id=conversation_id,
                 turn_id=turn_id,
                 messages=messages,
             ),
-            stream_mode=["messages", "values"]
+            version="v2"
         ):
-            if mode == "messages":
-                message_chunk, metadata = data
-                node = metadata.get("langgraph_node")
-                if node == "agent":
-                    yield "message", message_chunk.content
-            elif mode == "values":
-                final_state = data
+            event_type = event["event"]
+            name = event["name"]
 
-        with pool.connection() as connection:
-            # 一轮完整结束后再压缩，避免拆开 AI tool_call 与 ToolMessage。
-            compress_conversation_context(
-                messages=final_state["messages"],
-                current_summary=summary,
-                summary_until_turn_id=summary_until_turn_id,
-                conversation_id=conversation_id,
-                connection=connection,
-                summary_generator=generate_conversation_summary,
-            )
+            if event_type == "on_tool_start":
+                yield "status", f"执行工具{TOOL_STATUS.get(name)}"
+            elif event_type == "on_tool_end":
+                yield "status", f"{TOOL_STATUS.get(name)}执行完成"
+            elif event_type == "on_chat_model_stream":
+                chunk = event["data"]["chunk"]
+                if chunk.content:
+                    yield "message", chunk.content
+            elif event_type == "on_chain_end" and not event["parent_ids"]:
+                # on_chain_end 表示执行结束；
+                # parent_ids 为空表示该事件属于根 Graph，此时 output 为本轮最终状态
+                final_state = event["data"]["output"]
+
+        # 生成摘要期间不占用连接，压缩函数仅在写回摘要时借连接。
+        await compress_conversation_context(
+            messages=final_state["messages"],
+            current_summary=summary,
+            summary_until_turn_id=summary_until_turn_id,
+            conversation_id=conversation_id,
+            pool=pool,
+            summary_generator=generate_conversation_summary,
+        )
 
         yield "done", {}
     except Exception as e:
@@ -249,12 +244,17 @@ async def chat(question: str, conversation_id: UUID, user_id: str):
 
 
 async def main():
-    async for data in chat(
-        "你不是deepseek v4吗？",
-         UUID("9b3595d0-8a2d-4d5b-b89e-6e402beedd02"),
-        "akb48"
-    ):
-        print(data, end="", flush=True)
+    async with postgres_pool() as pool:
+        graph = build_agent(pool)
+        async for data in chat(
+            "你不是deepseek v4吗？",
+            UUID("9b3595d0-8a2d-4d5b-b89e-6e402beedd02"),
+            "akb48",
+            pool=pool,
+            graph=graph,
+        ):
+            print(data, end="", flush=True)
+
 
 if __name__ == "__main__":
     asyncio.run(main())

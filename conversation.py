@@ -1,7 +1,7 @@
 """会话消息持久化与短期上下文压缩。"""
 
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 from uuid import UUID
@@ -14,6 +14,7 @@ from langchain_core.messages import (
     ToolMessage,
 )
 from psycopg.types.json import Jsonb
+from psycopg_pool import AsyncConnectionPool
 from transformers import AutoTokenizer
 
 
@@ -25,7 +26,7 @@ CONTEXT_TARGET_TOKENS = 4_000
 MIN_RECENT_TURNS = 2
 
 MessageType = Literal["system", "human", "ai", "tool"]
-SummaryGenerator = Callable[[str | None, list[BaseMessage]], str]
+SummaryGenerator = Callable[[str | None, list[BaseMessage]], Awaitable[str]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,18 +79,18 @@ class CompressionResult:
     compressed: bool
 
 
-def insert_conversation(uid: UUID, user_id: str, connection: Any) -> None:
+async def insert_conversation(uid: UUID, user_id: str, connection: Any) -> None:
     sql = "INSERT INTO conversations (id, user_id) VALUES (%s, %s)"
     try:
-        with connection.cursor() as cursor:
-            cursor.execute(sql, (uid, user_id))
-        connection.commit()
+        async with connection.cursor() as cursor:
+            await cursor.execute(sql, (uid, user_id))
+        await connection.commit()
     except Exception:
-        connection.rollback()
+        await connection.rollback()
         raise
 
 
-def update_conversation_summary(
+async def update_conversation_summary(
     conversation_id: UUID,
     summary: str,
     summary_until_turn_id: int,
@@ -103,18 +104,18 @@ def update_conversation_summary(
         WHERE id = %s
     """
     try:
-        with connection.cursor() as cursor:
-            cursor.execute(
+        async with connection.cursor() as cursor:
+            await cursor.execute(
                 sql,
                 (summary, summary_until_turn_id, conversation_id),
             )
-        connection.commit()
+        await connection.commit()
     except Exception:
-        connection.rollback()
+        await connection.rollback()
         raise
 
 
-def insert_messages(
+async def insert_messages(
     messages: Sequence[MessageInsertRecord],
     connection: Any,
 ) -> None:
@@ -127,22 +128,22 @@ def insert_messages(
         VALUES (%s, %s, %s, %s)
     """
     try:
-        with connection.cursor() as cursor:
-            cursor.executemany(sql, [message.values() for message in messages])
-        connection.commit()
+        async with connection.cursor() as cursor:
+            await cursor.executemany(sql, [message.values() for message in messages])
+        await connection.commit()
     except Exception:
-        connection.rollback()
+        await connection.rollback()
         raise
 
 
-def load_conversation_context(
+async def load_conversation_context(
     connection: Any,
     conversation_id: UUID,
     user_id: str,
 ) -> ConversationContext:
     """创建或恢复会话，只加载尚未被累计摘要覆盖的消息。"""
-    with connection.cursor() as cursor:
-        cursor.execute(
+    async with connection.cursor() as cursor:
+        await cursor.execute(
             """
             SELECT summary, COALESCE(summary_until_turn_id, 0)
             FROM conversations
@@ -150,18 +151,18 @@ def load_conversation_context(
             """,
             (conversation_id,),
         )
-        conversation_row = cursor.fetchone()
+        conversation_row = await cursor.fetchone()
 
     if conversation_row is None:
-        insert_conversation(conversation_id, user_id, connection)
+        await insert_conversation(conversation_id, user_id, connection)
         summary = None
         summary_until_turn_id = 0
     else:
         summary, summary_until_turn_id = conversation_row
 
-    with connection.cursor() as cursor:
+    async with connection.cursor() as cursor:
         # next_turn_id 必须基于完整历史计算，不能依赖未压缩消息是否为空。
-        cursor.execute(
+        await cursor.execute(
             """
             SELECT COALESCE(MAX(turn_id), 0) + 1
             FROM conversation_messages
@@ -169,9 +170,9 @@ def load_conversation_context(
             """,
             (conversation_id,),
         )
-        next_turn_id = cursor.fetchone()[0]
+        next_turn_id = (await cursor.fetchone())[0]
 
-        cursor.execute(
+        await cursor.execute(
             """
             SELECT message_data
             FROM conversation_messages
@@ -183,7 +184,7 @@ def load_conversation_context(
         )
         recent_messages = [
             deserialize_message(row[0])
-            for row in cursor.fetchall()
+            for row in (await cursor.fetchall())
         ]
 
     return ConversationContext(
@@ -239,13 +240,13 @@ def split_into_turns(
     return prefix, turns
 
 
-def compress_conversation_context(
+async def compress_conversation_context(
     *,
     messages: list[BaseMessage],
     current_summary: str | None,
     summary_until_turn_id: int,
     conversation_id: UUID,
-    connection: Any,
+    pool: AsyncConnectionPool,
     summary_generator: SummaryGenerator,
 ) -> CompressionResult:
     """在完整一轮结束后压缩旧轮次，并把累计摘要边界写回数据库。"""
@@ -293,17 +294,18 @@ def compress_conversation_context(
         )
 
     messages_to_summarize = _flatten(turns_to_summarize)
-    new_summary = summary_generator(current_summary, messages_to_summarize).strip()
+    new_summary = (await summary_generator(current_summary, messages_to_summarize)).strip()
     if not new_summary:
         raise ValueError("摘要模型返回了空内容")
 
     new_summary_until_turn_id = summary_until_turn_id + len(turns_to_summarize)
-    update_conversation_summary(
-        conversation_id,
-        new_summary,
-        new_summary_until_turn_id,
-        connection,
-    )
+    async with pool.connection() as connection:
+        await update_conversation_summary(
+            conversation_id,
+            new_summary,
+            new_summary_until_turn_id,
+            connection,
+        )
 
     kept_messages = prefix + _flatten(complete_turns[keep_start:] + incomplete_turns)
     return CompressionResult(
