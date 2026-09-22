@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
 
 from psycopg_pool import AsyncConnectionPool
+from redis.asyncio import Redis
 
 from config import get_settings
 
@@ -34,3 +35,20 @@ async def postgres_pool() -> AsyncIterator[AsyncConnectionPool]:
         yield pool
     finally:
         await pool.close()
+
+
+@asynccontextmanager
+async def redis_pool() -> AsyncIterator[Redis]:
+    redis_data = get_settings().redis
+    # redis 默认维护一个连接池
+    redis_client = Redis(
+        host=redis_data.host,
+        port=redis_data.port,
+        db=redis_data.db,
+        decode_responses=True,
+    )
+    try:
+        await redis_client.ping()
+        yield redis_client
+    finally:
+        await redis_client.aclose()

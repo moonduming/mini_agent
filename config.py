@@ -25,6 +25,13 @@ class LLMSettings:
 
 
 @dataclass(frozen=True)
+class RedisSettings:
+    host: str
+    port: int
+    db: int
+
+
+@dataclass(frozen=True)
 class PostgresSettings:
     host: str
     port: int
@@ -43,6 +50,7 @@ class QdrantSettings:
 @dataclass(frozen=True)
 class Settings:
     llm: LLMSettings
+    redis: RedisSettings
     postgres: PostgresSettings
     qdrant: QdrantSettings
 
@@ -68,6 +76,11 @@ def get_settings() -> Settings:
                 base_url=parser.get("llm", "base_url"),
                 chat_model=parser.get("llm", "chat_model"),
                 embedding_model=parser.get("llm", "embedding_model"),
+            ),
+            redis=RedisSettings(
+                host=parser.get("redis", "host"),
+                port=parser.getint("redis", "port"),
+                db=parser.getint("redis", "db"),
             ),
             postgres=PostgresSettings(
                 host=parser.get("postgres", "host"),

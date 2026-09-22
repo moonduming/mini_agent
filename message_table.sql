@@ -22,8 +22,22 @@ CREATE TABLE conversation_messages (
         ON DELETE CASCADE,
 
     turn_id BIGINT NOT NULL,
+
     -- human / ai / tool / system
     message_type VARCHAR(32) NOT NULL,
+
+    -- pending / success / timeout / failed / cancelled
+    status VARCHAR(16) NOT NULL DEFAULT 'pending'
+        CHECK (status IN (
+            'pending',
+            'success',
+            'timeout',
+            'failed',
+            'cancelled'
+        )),
+
+    -- 失败、超时、取消时记录错误信息
+    error_message TEXT,
 
     -- 完整保存 LangChain Message
     -- 包括 content、tool_calls、tool_call_id 等

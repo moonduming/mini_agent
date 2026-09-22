@@ -7,7 +7,7 @@ from uuid import UUID
 from pydantic import BaseModel
 
 from agent import build_agent, chat
-from database import postgres_pool
+from database import postgres_pool, redis_pool
 
 
 class ChatRequest(BaseModel):
@@ -18,9 +18,13 @@ class ChatRequest(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    async with postgres_pool() as pool:
+    async with (
+        postgres_pool() as pool,
+        redis_pool() as redis_client,
+    ):
         app.state.postgres_pool = pool
         app.state.agent_graph = build_agent(pool)
+        app.state.redis_client = redis_client
         yield
 
 
@@ -39,6 +43,7 @@ async def get_chat(request: ChatRequest, http_request: Request):
         request.question,
         request.conversation_id,
         request.user_id,
+        redis_client=http_request.app.state.redis_client,
         pool=http_request.app.state.postgres_pool,
         graph=http_request.app.state.agent_graph,
     ):

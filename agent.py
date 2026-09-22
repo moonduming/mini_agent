@@ -2,10 +2,11 @@
 import asyncio
 from dataclasses import dataclass, field
 from typing import Annotated, Any
-from uuid import UUID
+from uuid import UUID, uuid4
 from psycopg_pool import AsyncConnectionPool
+from redis.asyncio import Redis
 
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
@@ -19,14 +20,22 @@ from conversation import (
     format_messages_for_summary,
     insert_messages,
     load_conversation_context,
+    load_successful_turns,
+    update_turn_message_status
 )
-from database import postgres_pool
+from database import postgres_pool, redis_pool
 from tools import build_tools
+from errors import AgentError
 
 
 BASE_SYSTEM_PROMPT = """你是一个日志分析助手，会使用工具，不要编造不存在的日志。
 分析日志时先调用 summarize_log_errors；只有摘要不能解释主要错误时，
-才调用 get_log_error_examples。不要请求大量原始日志，也不要重复相同参数的查询。"""
+才调用 get_log_error_examples。不要请求大量原始日志，也不要重复相同参数的查询。
+
+如果工具调用失败，不要编造工具结果，也不要重复调用相同参数的失败工具。
+如果根据已有对话和已成功获取的信息仍能回答用户问题，则基于这些信息继续回答；
+如果只能回答部分内容，则回答能够确定的部分，并明确说明哪些内容因工具调用失败而无法确认；
+如果缺少该工具结果就无法可靠回答，则直接说明工具调用失败，当前无法得出可靠结论。"""
 
 SUMMARY_SYSTEM_PROMPT = """你负责维护多轮日志分析对话的累计摘要。
 请保留用户目标、时间范围、日志类型、关键错误及其数量、工具证据、已确认结论、
@@ -39,6 +48,10 @@ TOOL_STATUS = {
     "search_knowledge_base": "搜索知识库",
     "summarize_log_errors": "获取错误日志摘要"
 }
+
+CHAT_TIMEOUT_SECONDS = 110
+LOCK_TTL_SECONDS = 120
+CLEANUP_TIMEOUT_SECONDS = 4
 
 settings = get_settings()
 model = ChatOpenAI(
@@ -146,22 +159,66 @@ def build_agent(pool: AsyncConnectionPool) -> CompiledStateGraph:
             "tool_call_count": state.tool_call_count + len(tool_messages),
         }
 
+    async def finalize_node(state: AgentState):
+        reason = "工具调用次数已达上限。" if not state.can_call_tool else "Agent 循环次数已达上限。"
+        instruction = HumanMessage(
+            content=(
+                f"{reason}"
+                "请根据目前已经获得的信息生成最终回答。"
+                "不要继续调用工具，不要编造缺失信息；"
+                "无法确定的部分明确说明无法确定。"
+            )
+        )
+        # 保留调用记录，为每个未执行的调用补齐明确的失败结果。
+        skipped_messages = [
+            ToolMessage(
+                content=f"{reason}该工具未执行，没有查询结果。",
+                tool_call_id=call["id"],
+                name=call["name"],
+                status="error",
+            )
+            for call in state.messages[-1].tool_calls
+        ]
+        async with pool.connection() as connection:
+            await insert_messages(
+                [MessageInsertRecord.from_message(state.conversation_id, state.turn_id, m)
+                 for m in skipped_messages],
+                connection,
+            )
+        response = await model.ainvoke(state.messages + skipped_messages + [instruction])
+
+        async with pool.connection() as connection:
+            await insert_messages(
+                [
+                    MessageInsertRecord.from_message(
+                        state.conversation_id,
+                        state.turn_id,
+                        response,
+                    )
+                ],
+                connection,
+            )
+
+        return {"messages": [*skipped_messages, response]}
+
     def route_after_agent(state: AgentState):
-        if not state.can_loop or not state.can_call_tool:
+        if state.messages and (not state.messages[-1].tool_calls):
             return "end"
-        if state.messages and state.messages[-1].tool_calls:
-            return "tools"
-        return "end"
+        if (not state.can_loop) or (not state.can_call_tool):
+            return "finalize"
+        return "tools"
 
     graph = StateGraph(AgentState)
     graph.add_node("agent", agent_node)
     graph.add_node("tools", tools_node)
+    graph.add_node("finalize", finalize_node)
     graph.add_edge(START, "agent")
     graph.add_edge("tools", "agent")
+    graph.add_edge("finalize", END)
     graph.add_conditional_edges(
         "agent",
         route_after_agent,
-        {"tools": "tools", "end": END},
+        {"tools": "tools", "finalize": "finalize", "end": END},
     )
     return graph.compile()
 
@@ -171,85 +228,118 @@ async def chat(
     conversation_id: UUID,
     user_id: str,
     *,
+    redis_client: Redis,
     pool: AsyncConnectionPool,
     graph: CompiledStateGraph,
 ):
+    acquired = False
+    lock_key = f"agent:conversation:{conversation_id}:lock"
+    lock_token = uuid4().hex
+    turn_id = None
+    answer_succeeded = False
+
+    async def mark_failure(status: str, message: str):
+        if turn_id is None or answer_succeeded:
+            return
+        try:
+            async with asyncio.timeout(CLEANUP_TIMEOUT_SECONDS):
+                await update_turn_message_status(
+                    conversation_id=conversation_id, turn_id=turn_id,
+                    status=status, pool=pool, error_message=message,
+                )
+        except Exception as status_error:
+            print(f"更新错误状态失败: {status_error}")
+
     try:
-        async with pool.connection() as connection:
-            context = await load_conversation_context(
-                connection,
-                conversation_id,
-                user_id,
+        # 从获取锁开始计时，覆盖历史读取、图执行、落库和摘要维护。
+        async with asyncio.timeout(CHAT_TIMEOUT_SECONDS):
+            acquired = await redis_client.set(
+                lock_key, lock_token, nx=True, ex=LOCK_TTL_SECONDS,
             )
-            summary = context.summary
-            summary_until_turn_id = context.summary_until_turn_id
-            turn_id = context.next_turn_id
-            messages: list[BaseMessage] = [
-                build_system_message(summary),
-                *context.recent_messages,
-            ]
+            if not acquired:
+                yield "error", {"message": "当前对话正在处理中，请稍后重试"}
+                return
+            async with pool.connection() as connection:
+                context = await load_conversation_context(connection, conversation_id, user_id)
+                turn_id = context.next_turn_id
+                human_message = HumanMessage(content=question)
+                messages = [build_system_message(context.summary), *context.recent_messages, human_message]
+                await insert_messages(
+                    [MessageInsertRecord.from_message(conversation_id, turn_id, human_message)],
+                    connection,
+                )
 
-            human_message = HumanMessage(content=question)
-            messages.append(human_message)
-            await insert_messages(
-                [
-                    MessageInsertRecord.from_message(
-                        conversation_id,
-                        turn_id,
-                        human_message,
+            async for event in graph.astream_events(
+                AgentState(conversation_id=conversation_id, turn_id=turn_id, messages=messages),
+                version="v2",
+            ):
+                event_type = event["event"]
+                name = event["name"]
+                if event_type == "on_tool_start":
+                    yield "status", f"执行工具{TOOL_STATUS.get(name)}"
+                elif event_type == "on_tool_end":
+                    yield "status", f"{TOOL_STATUS.get(name)}执行完成"
+                elif event_type == "on_chat_model_stream":
+                    chunk = event["data"]["chunk"]
+                    if chunk.content:
+                        yield "message", chunk.content
+
+            await update_turn_message_status(
+                conversation_id=conversation_id, turn_id=turn_id, status="success", pool=pool,
+            )
+            answer_succeeded = True
+            # 从成功历史读取真实轮次；模型生成摘要期间不占数据库连接。
+            try:
+                async with pool.connection() as connection:
+                    turns = await load_successful_turns(
+                        connection, conversation_id, context.summary_until_turn_id,
                     )
-                ],
-                connection,
-            )
-
-        final_state = None
-        async for event in graph.astream_events(
-            AgentState(
-                conversation_id=conversation_id,
-                turn_id=turn_id,
-                messages=messages,
-            ),
-            version="v2"
-        ):
-            event_type = event["event"]
-            name = event["name"]
-
-            if event_type == "on_tool_start":
-                yield "status", f"执行工具{TOOL_STATUS.get(name)}"
-            elif event_type == "on_tool_end":
-                yield "status", f"{TOOL_STATUS.get(name)}执行完成"
-            elif event_type == "on_chat_model_stream":
-                chunk = event["data"]["chunk"]
-                if chunk.content:
-                    yield "message", chunk.content
-            elif event_type == "on_chain_end" and not event["parent_ids"]:
-                # on_chain_end 表示执行结束；
-                # parent_ids 为空表示该事件属于根 Graph，此时 output 为本轮最终状态
-                final_state = event["data"]["output"]
-
-        # 生成摘要期间不占用连接，压缩函数仅在写回摘要时借连接。
-        await compress_conversation_context(
-            messages=final_state["messages"],
-            current_summary=summary,
-            summary_until_turn_id=summary_until_turn_id,
-            conversation_id=conversation_id,
-            pool=pool,
-            summary_generator=generate_conversation_summary,
-        )
-
+                await compress_conversation_context(
+                    turns=turns, current_summary=context.summary,
+                    summary_until_turn_id=context.summary_until_turn_id,
+                    conversation_id=conversation_id, pool=pool,
+                    summary_generator=generate_conversation_summary,
+                    system_message=build_system_message(context.summary),
+                )
+            except Exception as summary_error:
+                print(f"摘要更新失败，保留旧摘要: {summary_error}")
         yield "done", {}
+    except asyncio.CancelledError:
+        await mark_failure("cancelled", "请求已取消")
+        raise
     except Exception as e:
         print(f"agent执行异常: {e}")
-        yield "error", {"message": "执行异常"}
+        if answer_succeeded:
+            # 回答已完成落库；摘要维护耗尽剩余时间不会使回答变成失败。
+            yield "done", {}
+        else:
+            error = AgentError(e)
+            await mark_failure(error.status, str(e))
+            yield "error", {"code": error.code, "message": error.user_message}
+    finally:
+        release_script = """
+        if redis.call("get", KEYS[1]) == ARGV[1] then
+            return redis.call("del", KEYS[1])
+        else
+            return 0
+        end
+        """
+        if acquired:
+            try:
+                async with asyncio.timeout(CLEANUP_TIMEOUT_SECONDS):
+                    await redis_client.eval(release_script, 1, lock_key, lock_token)
+            except Exception as e:
+                print(f"释放锁失败{conversation_id}: {e}")
 
 
 async def main():
-    async with postgres_pool() as pool:
+    async with postgres_pool() as pool, redis_pool() as redis_client:
         graph = build_agent(pool)
         async for data in chat(
             "你不是deepseek v4吗？",
             UUID("9b3595d0-8a2d-4d5b-b89e-6e402beedd02"),
             "akb48",
+            redis_client=redis_client,
             pool=pool,
             graph=graph,
         ):

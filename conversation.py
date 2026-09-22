@@ -62,6 +62,14 @@ class MessageInsertRecord:
 
 
 @dataclass(slots=True)
+class ConversationTurn:
+    """应用内部的轮次信息；仅 messages 会传给模型。"""
+
+    turn_id: int
+    messages: list[BaseMessage]
+
+
+@dataclass(slots=True)
 class ConversationContext:
     """数据库恢复出的会话上下文；summary 不进入 AgentState。"""
 
@@ -88,6 +96,31 @@ async def insert_conversation(uid: UUID, user_id: str, connection: Any) -> None:
     except Exception:
         await connection.rollback()
         raise
+
+
+async def update_turn_message_status(
+    *,
+    conversation_id: UUID,
+    turn_id: int,
+    status: str,
+    pool: AsyncConnectionPool,
+    error_message: str | None = None,
+) -> None:
+    sql = """
+        UPDATE conversation_messages
+        SET status = %s,
+            error_message = %s
+        WHERE conversation_id = %s
+            AND turn_id = %s
+            AND status = 'pending'
+    """
+    async with pool.connection() as connection:
+        async with connection.cursor() as cursor:
+            await cursor.execute(
+                sql,
+                (status, error_message, conversation_id, turn_id),
+            )
+
 
 
 async def update_conversation_summary(
@@ -172,20 +205,8 @@ async def load_conversation_context(
         )
         next_turn_id = (await cursor.fetchone())[0]
 
-        await cursor.execute(
-            """
-            SELECT message_data
-            FROM conversation_messages
-            WHERE conversation_id = %s
-              AND turn_id > %s
-            ORDER BY id
-            """,
-            (conversation_id, summary_until_turn_id),
-        )
-        recent_messages = [
-            deserialize_message(row[0])
-            for row in (await cursor.fetchall())
-        ]
+    turns = await load_successful_turns(connection, conversation_id, summary_until_turn_id)
+    recent_messages = [message for turn in turns for message in turn.messages]
 
     return ConversationContext(
         summary=summary,
@@ -193,6 +214,33 @@ async def load_conversation_context(
         next_turn_id=next_turn_id,
         recent_messages=recent_messages,
     )
+
+
+async def load_successful_turns(
+    connection: Any,
+    conversation_id: UUID,
+    summary_until_turn_id: int,
+) -> list[ConversationTurn]:
+    """读取成功历史并保留真实轮次 ID，失败轮次产生的编号空洞不会丢失。"""
+    async with connection.cursor() as cursor:
+        await cursor.execute(
+            """
+            SELECT turn_id, message_data
+            FROM conversation_messages
+            WHERE conversation_id = %s
+              AND turn_id > %s
+              AND status = 'success'
+            ORDER BY turn_id, id
+            """,
+            (conversation_id, summary_until_turn_id),
+        )
+        rows = await cursor.fetchall()
+    turns: list[ConversationTurn] = []
+    for turn_id, message_data in rows:
+        if not turns or turns[-1].turn_id != turn_id:
+            turns.append(ConversationTurn(turn_id, []))
+        turns[-1].messages.append(deserialize_message(message_data))
+    return turns
 
 
 def deserialize_message(message_data: dict[str, Any]) -> BaseMessage:
@@ -216,104 +264,49 @@ def count_message_tokens(messages: Sequence[BaseMessage]) -> int:
     return len(TOKENIZER.encode(text, add_special_tokens=False))
 
 
-def split_into_turns(
-    messages: Sequence[BaseMessage],
-) -> tuple[list[BaseMessage], list[list[BaseMessage]]]:
-    """按 HumanMessage 划分完整轮次，不向模型内容中写入 turn_id。"""
-    prefix: list[BaseMessage] = []
-    turns: list[list[BaseMessage]] = []
-    current_turn: list[BaseMessage] = []
-
-    for message in messages:
-        if isinstance(message, HumanMessage):
-            if current_turn:
-                turns.append(current_turn)
-            current_turn = [message]
-        elif current_turn:
-            current_turn.append(message)
-        else:
-            # 正常情况下这里只会出现 SystemMessage；异常前缀保留但不摘要。
-            prefix.append(message)
-
-    if current_turn:
-        turns.append(current_turn)
-    return prefix, turns
-
-
 async def compress_conversation_context(
     *,
-    messages: list[BaseMessage],
+    turns: list[ConversationTurn],
     current_summary: str | None,
     summary_until_turn_id: int,
     conversation_id: UUID,
     pool: AsyncConnectionPool,
     summary_generator: SummaryGenerator,
+    system_message: SystemMessage | None = None,
 ) -> CompressionResult:
-    """在完整一轮结束后压缩旧轮次，并把累计摘要边界写回数据库。"""
-    # SystemMessage 每次由应用层根据当前 summary 重建，不属于可压缩历史。
-    recent_messages = list(messages)
-    while recent_messages and isinstance(recent_messages[0], SystemMessage):
-        recent_messages.pop(0)
+    """只压缩成功轮次的连续前缀，边界取最后一个实际覆盖的轮次 ID。"""
+    recent_messages = [message for turn in turns for message in turn.messages]
+    unchanged = CompressionResult(
+        current_summary, summary_until_turn_id, recent_messages, False,
+    )
+    token_messages = ([system_message] if system_message else []) + recent_messages
+    if count_message_tokens(token_messages) < CONTEXT_TRIGGER_TOKENS:
+        return unchanged
+    if len(turns) <= MIN_RECENT_TURNS:
+        return unchanged
 
-    if count_message_tokens(messages) < CONTEXT_TRIGGER_TOKENS:
-        return CompressionResult(
-            summary=current_summary,
-            summary_until_turn_id=summary_until_turn_id,
-            recent_messages=recent_messages,
-            compressed=False,
-        )
-
-    prefix, turns = split_into_turns(recent_messages)
-    complete_turns, incomplete_turns = _separate_incomplete_tail(turns)
-    if len(complete_turns) <= MIN_RECENT_TURNS:
-        return CompressionResult(
-            summary=current_summary,
-            summary_until_turn_id=summary_until_turn_id,
-            recent_messages=recent_messages,
-            compressed=False,
-        )
-
-    keep_start = len(complete_turns) - MIN_RECENT_TURNS
-    tail_messages = prefix + _flatten(complete_turns[keep_start:] + incomplete_turns)
-
-    # 尽量多保留近期轮次，但压缩后上下文应降到目标 token 附近。
+    keep_start = len(turns) - MIN_RECENT_TURNS
+    tail_messages = [m for turn in turns[keep_start:] for m in turn.messages]
     while keep_start > 0:
-        candidate = complete_turns[keep_start - 1] + tail_messages
+        candidate = turns[keep_start - 1].messages + tail_messages
         if count_message_tokens(candidate) > CONTEXT_TARGET_TOKENS:
             break
         keep_start -= 1
         tail_messages = candidate
+    if keep_start == 0:
+        return unchanged
 
-    turns_to_summarize = complete_turns[:keep_start]
-    if not turns_to_summarize:
-        return CompressionResult(
-            summary=current_summary,
-            summary_until_turn_id=summary_until_turn_id,
-            recent_messages=recent_messages,
-            compressed=False,
-        )
-
-    messages_to_summarize = _flatten(turns_to_summarize)
+    turns_to_summarize = turns[:keep_start]
+    messages_to_summarize = [m for turn in turns_to_summarize for m in turn.messages]
     new_summary = (await summary_generator(current_summary, messages_to_summarize)).strip()
     if not new_summary:
         raise ValueError("摘要模型返回了空内容")
-
-    new_summary_until_turn_id = summary_until_turn_id + len(turns_to_summarize)
+    new_summary_until_turn_id = turns_to_summarize[-1].turn_id
     async with pool.connection() as connection:
         await update_conversation_summary(
-            conversation_id,
-            new_summary,
-            new_summary_until_turn_id,
-            connection,
+            conversation_id, new_summary, new_summary_until_turn_id, connection,
         )
-
-    kept_messages = prefix + _flatten(complete_turns[keep_start:] + incomplete_turns)
-    return CompressionResult(
-        summary=new_summary,
-        summary_until_turn_id=new_summary_until_turn_id,
-        recent_messages=kept_messages,
-        compressed=True,
-    )
+    return CompressionResult(new_summary, new_summary_until_turn_id, tail_messages, True)
 
 
 def format_messages_for_summary(messages: Sequence[BaseMessage]) -> str:
@@ -340,22 +333,3 @@ def _message_as_text(message: BaseMessage) -> str:
             + json.dumps(message.tool_calls, ensure_ascii=False, default=str)
         )
     return "\n".join(parts)
-
-
-def _separate_incomplete_tail(
-    turns: list[list[BaseMessage]],
-) -> tuple[list[list[BaseMessage]], list[list[BaseMessage]]]:
-    if not turns:
-        return [], []
-    last_message = turns[-1][-1]
-    is_complete = (
-        isinstance(last_message, AIMessage)
-        and not last_message.tool_calls
-    )
-    if is_complete:
-        return turns, []
-    return turns[:-1], turns[-1:]
-
-
-def _flatten(turns: Sequence[Sequence[BaseMessage]]) -> list[BaseMessage]:
-    return [message for turn in turns for message in turn]

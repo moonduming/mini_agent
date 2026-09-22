@@ -65,7 +65,7 @@ class AsyncRuntimeTests(unittest.IsolatedAsyncioTestCase):
         for fail_build in (False, True):
             pool = SimpleNamespace(open=AsyncMock(), close=AsyncMock())
             graph = object()
-            with patch.object(database, 'create_postgres_pool', return_value=pool), patch.object(
+            with patch.object(database, 'Redis', return_value=SimpleNamespace(ping=AsyncMock(), aclose=AsyncMock())), patch.object(database, 'create_postgres_pool', return_value=pool), patch.object(
                 api, 'build_agent', return_value=graph,
                 side_effect=RuntimeError('graph failed') if fail_build else None,
             ) as build:
@@ -130,8 +130,8 @@ class AsyncRuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_log_query_failure_releases_connection(self):
         pool = TrackingPool()
         pool.cursor.execute.side_effect = RuntimeError('query failed')
-        with self.assertRaisesRegex(RuntimeError, 'query failed'):
-            await build_tools(pool)[1].ainvoke({'fingerprint': 'a' * 64})
+        result = await build_tools(pool)[1].ainvoke({'fingerprint': 'a' * 64})
+        self.assertEqual(result, {'error': 'query failed'})
         self.assertEqual(pool.active, 0)
 
     async def test_summary_awaits_model(self):
@@ -161,7 +161,8 @@ class AsyncRuntimeTests(unittest.IsolatedAsyncioTestCase):
             conversation, 'update_conversation_summary', new=AsyncMock(side_effect=save)
         ) as update:
             result = await conversation.compress_conversation_context(
-                messages=messages, current_summary=None, summary_until_turn_id=0,
+                turns=[conversation.ConversationTurn(i + 1, messages[i*2:i*2+2]) for i in range(3)],
+                current_summary=None, summary_until_turn_id=0,
                 conversation_id=uid, pool=pool, summary_generator=summarize,
             )
         self.assertTrue(result.compressed)
@@ -174,7 +175,7 @@ class AsyncRuntimeTests(unittest.IsolatedAsyncioTestCase):
         summary = AsyncMock()
         with patch.object(conversation, 'count_message_tokens', return_value=0):
             result = await conversation.compress_conversation_context(
-                messages=[], current_summary=None, summary_until_turn_id=0,
+                turns=[], current_summary=None, summary_until_turn_id=0,
                 conversation_id=uuid4(), pool=pool, summary_generator=summary,
             )
         self.assertFalse(result.compressed)
@@ -196,9 +197,12 @@ class AsyncRuntimeTests(unittest.IsolatedAsyncioTestCase):
         graph.astream_events = events
         with patch.object(agent, 'load_conversation_context', new=AsyncMock(return_value=context)), patch.object(
             agent, 'insert_messages', new=AsyncMock()
+        ), patch.object(agent, 'update_turn_message_status', new=AsyncMock()), patch.object(
+            agent, 'load_successful_turns', new=AsyncMock(return_value=[])
         ), patch.object(agent, 'compress_conversation_context', new=AsyncMock()) as compress:
             result = [event async for event in agent.chat(
                 '问题', uuid4(), 'user', pool=pool, graph=graph,
+                redis_client=SimpleNamespace(set=AsyncMock(return_value=True), eval=AsyncMock(return_value=1)),
             )]
         self.assertEqual(result, [('message', '回答'), ('done', {})])
         self.assertIs(compress.await_args.kwargs['pool'], pool)
