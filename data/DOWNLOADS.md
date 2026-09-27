@@ -67,11 +67,24 @@ curl -L 'https://raw.githubusercontent.com/apache/kafka/trunk/docs/operations/ba
 curl -L 'https://raw.githubusercontent.com/apache/kafka/trunk/docs/operations/kraft.md' -o data/knowledge_raw/markdown/kafka/kraft.md
 ```
 
+## OpenStack 知识库（由官方文档转换为 Markdown）
+
+以下文档取自 OpenStack 2025.2 官方文档集，保存于 `knowledge_raw/markdown/openstack/`。每篇文档的 YAML 元数据记录原始链接、页面最后更新时间、获取日期和 CC BY 3.0 许可。文档集版本不等于各页面的最后更新时间；执行运维命令前应核对目标部署的版本和配置。
+
+| 主题 | 官方页面 | 保存文件 |
+| --- | --- | --- |
+| Nova 计算服务排障 | https://docs.openstack.org/nova/2025.2/admin/support-compute.html | `openstack/nova-support-compute.md` |
+| Nova 日志位置 | https://docs.openstack.org/nova/2025.2/admin/configuration/logs.html | `openstack/nova-compute-logs.md` |
+| Neutron OVN 排障 | https://docs.openstack.org/neutron/2025.2/admin/ovn/troubleshooting.html | `openstack/neutron-ovn-troubleshooting.md` |
+| Neutron 网络概览 | https://docs.openstack.org/neutron/2025.2/admin/intro-os-networking.html | `openstack/neutron-networking-overview.md` |
+| Cinder 配置排障 | https://docs.openstack.org/cinder/2025.2/admin/ts-cinder-config.html | `openstack/cinder-configuration-troubleshooting.md` |
+| Cinder 卷管理 | https://docs.openstack.org/cinder/2025.2/admin/manage-volumes.html | `openstack/cinder-manage-volumes.md` |
+| Cinder 卷备份与恢复 | https://docs.openstack.org/cinder/2025.2/admin/volume-backups.html | `openstack/cinder-volume-backups.md` |
+
 ## 目录说明
 
 - `raw_logs/*.log`：现有 2k 行样本，继续用于快速调试和单元测试。
 - `raw_logs/full/`：自行下载的完整日志压缩包及解压内容。
 - `knowledge_raw/*.html`：此前下载的网页版本，暂时保留，不建议直接入库。
-- `knowledge_raw/markdown/`：干净的官方 Markdown，作为首批 RAG 原始文档。
+- `knowledge_raw/markdown/`：官方 Markdown 或从官方页面正文转换的 Markdown，作为 RAG 原始文档。
 - `eval/`：后续放人工编写的测试问题和标准答案。
-

@@ -24,13 +24,20 @@ qdrant_client = QdrantClient(
 )
 
 MARKDOWN_PATHS = [
-    PROJECT_ROOT / "data/knowledge_raw/markdown/kafka/basic-kafka-operations.md",
-    PROJECT_ROOT / "data/knowledge_raw/markdown/kafka/kraft.md",
-    PROJECT_ROOT / "data/knowledge_raw/markdown/kubernetes/debug-init-containers.md",
-    PROJECT_ROOT / "data/knowledge_raw/markdown/kubernetes/debug-running-pod.md",
-    PROJECT_ROOT / "data/knowledge_raw/markdown/kubernetes/determine-reason-pod-failure.md",
-    PROJECT_ROOT / "data/knowledge_raw/markdown/kubernetes/debug-pods.md",
-    PROJECT_ROOT / "data/knowledge_raw/markdown/kubernetes/debug-service.md",
+    # PROJECT_ROOT / "data/knowledge_raw/markdown/kafka/basic-kafka-operations.md",
+    # PROJECT_ROOT / "data/knowledge_raw/markdown/kafka/kraft.md",
+    # PROJECT_ROOT / "data/knowledge_raw/markdown/kubernetes/debug-init-containers.md",
+    # PROJECT_ROOT / "data/knowledge_raw/markdown/kubernetes/debug-running-pod.md",
+    # PROJECT_ROOT / "data/knowledge_raw/markdown/kubernetes/determine-reason-pod-failure.md",
+    # PROJECT_ROOT / "data/knowledge_raw/markdown/kubernetes/debug-pods.md",
+    # PROJECT_ROOT / "data/knowledge_raw/markdown/kubernetes/debug-service.md",
+    PROJECT_ROOT / "data/knowledge_raw/markdown/openstack/nova-support-compute.md",
+    PROJECT_ROOT / "data/knowledge_raw/markdown/openstack/nova-compute-logs.md",
+    PROJECT_ROOT / "data/knowledge_raw/markdown/openstack/neutron-ovn-troubleshooting.md",
+    PROJECT_ROOT / "data/knowledge_raw/markdown/openstack/neutron-networking-overview.md",
+    PROJECT_ROOT / "data/knowledge_raw/markdown/openstack/cinder-configuration-troubleshooting.md",
+    PROJECT_ROOT / "data/knowledge_raw/markdown/openstack/cinder-manage-volumes.md",
+    PROJECT_ROOT / "data/knowledge_raw/markdown/openstack/cinder-volume-backups.md",
 ]
 
 
