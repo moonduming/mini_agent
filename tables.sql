@@ -49,3 +49,12 @@ CREATE TABLE conversation_messages (
 
 CREATE INDEX idx_conversation_messages_conversation_id_id
     ON conversation_messages(conversation_id, id);
+
+
+CREATE TABLE users (
+    id UUID PRIMARY KEY,
+    username VARCHAR(64) NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);

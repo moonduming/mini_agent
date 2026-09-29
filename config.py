@@ -53,6 +53,7 @@ class Settings:
     redis: RedisSettings
     postgres: PostgresSettings
     qdrant: QdrantSettings
+    jwt_secret: str
 
 
 @lru_cache(maxsize=1)
@@ -94,6 +95,7 @@ def get_settings() -> Settings:
                 port=parser.getint("qdrant", "port"),
                 collection=parser.get("qdrant", "collection"),
             ),
+            jwt_secret=parser.get("jwt", "secret"),
         )
     except (ConfigParserError, ValueError) as error:
         raise RuntimeError(f"配置文件格式错误：{config_path}，{error}") from error

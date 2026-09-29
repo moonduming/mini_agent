@@ -2,6 +2,8 @@ import openai
 
 
 class ErrorCode:
+    FORBIDDEN = "forbidden"
+
     # 未知内部异常
     INTERNAL_ERROR = "internal_error"
 
@@ -36,6 +38,11 @@ class AgentError:
 
     def _classify(self):
         """根据底层异常类型进行分类。"""
+
+        if isinstance(self.error, PermissionError):
+            self.code = ErrorCode.FORBIDDEN
+            self.user_message = "无权访问此会话，请新建会话"
+            return
 
         # asyncio.timeout() 产生的超时
         if isinstance(self.error, TimeoutError):

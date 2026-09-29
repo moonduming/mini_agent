@@ -158,6 +158,8 @@ def build_tools(pool: AsyncConnectionPool) -> list[BaseTool]:
     @tool
     async def get_log_error_examples(
         fingerprint: str,
+        start_at: str,
+        end_at: str,
         limit: int = DEFAULT_DETAIL_LOGS,
     ) -> dict[str, Any]:
         """获取一个错误指纹的少量代表日志，用于确认错误上下文。
@@ -167,12 +169,16 @@ def build_tools(pool: AsyncConnectionPool) -> list[BaseTool]:
 
         Args:
             fingerprint: summarize_log_errors 返回的 64 位错误指纹。
+            start_at: 必须沿用概览返回的 query.start_at。
+                ISO 8601 格式的查询开始时间。
+            end_at: 必须沿用概览返回的 query.end_at_exclusive（完整时间字符串）。
             limit: 返回日志条数，默认且最大为 3。
         Returns:
             包含代表日志、has_more 及原始日志是否被截断的信息。
         """
         try:
             normalized_fingerprint = fingerprint.strip().lower()
+            query_start_at, query_end_at = _build_log_time_range(start_at, end_at)
             if not FINGERPRINT_PATTERN.fullmatch(normalized_fingerprint):
                 raise ValueError("fingerprint 必须是摘要工具返回的 64 位十六进制字符串")
 
@@ -193,6 +199,8 @@ def build_tools(pool: AsyncConnectionPool) -> list[BaseTool]:
                 FROM logs
                 WHERE is_error = TRUE
                   AND error_fingerprint = %s
+                  AND occurred_at >= %s
+                  AND occurred_at < %s
                 ORDER BY occurred_at DESC
                 LIMIT %s;
             """
@@ -201,6 +209,8 @@ def build_tools(pool: AsyncConnectionPool) -> list[BaseTool]:
                 MAX_LOG_EXCERPT_CHARS,
                 MAX_LOG_EXCERPT_CHARS,
                 normalized_fingerprint,
+                query_start_at,
+                query_end_at,
                 query_limit + 1,
             ]
 
@@ -321,6 +331,8 @@ async def main():
         for group in query["groups"]:
             print(await get_log_error_examples.ainvoke({
                 "fingerprint": group["error_fingerprint"],
+                "start_at": query["query"]["start_at"],
+                "end_at": query["query"]["end_at_exclusive"],
             }))
 
 

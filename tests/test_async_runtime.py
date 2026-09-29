@@ -91,7 +91,7 @@ class AsyncRuntimeTests(unittest.IsolatedAsyncioTestCase):
             {'name': tools[0].name, 'args': {
                 'start_at': '2017-05-14', 'end_at': '2017-05-16',
             }, 'id': 'summary'},
-            {'name': tools[1].name, 'args': {'fingerprint': 'a' * 64}, 'id': 'details'},
+            {'name': tools[1].name, 'args': {'fingerprint': 'a' * 64, 'start_at': '2017-05-14', 'end_at': '2017-05-16'}, 'id': 'details'},
         ])
         graph = StateGraph(MessagesState)
         graph.add_node('tools', ToolNode(tools))
@@ -109,7 +109,7 @@ class AsyncRuntimeTests(unittest.IsolatedAsyncioTestCase):
         bound = SimpleNamespace(ainvoke=AsyncMock(side_effect=[
             AIMessage(content='', tool_calls=[{
                 'name': 'get_log_error_examples',
-                'args': {'fingerprint': 'a' * 64}, 'id': 'details',
+                'args': {'fingerprint': 'a' * 64, 'start_at': '2017-05-14', 'end_at': '2017-05-16'}, 'id': 'details',
             }]),
             AIMessage(content='回答'),
         ]))
@@ -130,7 +130,7 @@ class AsyncRuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_log_query_failure_releases_connection(self):
         pool = TrackingPool()
         pool.cursor.execute.side_effect = RuntimeError('query failed')
-        result = await build_tools(pool)[1].ainvoke({'fingerprint': 'a' * 64})
+        result = await build_tools(pool)[1].ainvoke({'fingerprint': 'a' * 64, 'start_at': '2017-05-14', 'end_at': '2017-05-16'})
         self.assertEqual(result, {'error': 'query failed'})
         self.assertEqual(pool.active, 0)
 

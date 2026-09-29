@@ -209,14 +209,14 @@
     <div class="layout">
       <section class="card chat">
         <div id="messages" class="messages">
-          <div id="empty" class="empty">输入问题后点击“发送”<br>响应会随着 SSE 消息实时显示</div>
+          <div id="empty" class="empty">先在右侧登录，再输入问题<br>响应会随着 SSE 消息实时显示</div>
         </div>
         <div id="progress" class="request-progress" role="status">等待发送请求</div>
         <div class="composer">
           <textarea id="question" aria-label="问题" placeholder="例如：分析 2017-05-15 到 2017-05-17 的 ERROR 日志"></textarea>
           <div class="actions">
             <button id="stop" class="danger" disabled>停止</button>
-            <button id="send">发送</button>
+            <button id="send" disabled>发送</button>
           </div>
         </div>
       </section>
@@ -226,8 +226,17 @@
         <label for="endpoint">接口地址</label>
         <input id="endpoint" value="/chat">
 
-        <label for="userId">用户 ID</label>
-        <input id="userId" value="akb48">
+        <form id="loginForm">
+          <label for="username">用户名</label>
+          <input id="username" autocomplete="username" required>
+          <label for="password">密码</label>
+          <input id="password" type="password" autocomplete="current-password" required>
+          <div class="actions">
+            <button id="login" type="submit">登录</button>
+            <button id="logout" type="button" class="secondary" disabled>退出</button>
+          </div>
+        </form>
+        <div id="authStatus" class="hint" role="status">未登录。登录凭证仅保存在当前页面，刷新后需重新登录。</div>
 
         <label for="conversationId">会话 ID</label>
         <input id="conversationId">
@@ -250,7 +259,12 @@
       empty: document.querySelector('#empty'),
       question: document.querySelector('#question'),
       endpoint: document.querySelector('#endpoint'),
-      userId: document.querySelector('#userId'),
+      loginForm: document.querySelector('#loginForm'),
+      username: document.querySelector('#username'),
+      password: document.querySelector('#password'),
+      login: document.querySelector('#login'),
+      logout: document.querySelector('#logout'),
+      authStatus: document.querySelector('#authStatus'),
       conversationId: document.querySelector('#conversationId'),
       eventLog: document.querySelector('#eventLog'),
       status: document.querySelector('#status'),
@@ -262,6 +276,62 @@
     };
 
     let abortController = null;
+    let token = null;
+    let loginPending = false;
+
+    function endpointUrl() {
+      const url = new URL(elements.endpoint.value.trim() || '/chat', location.href);
+      if (url.origin !== location.origin) throw new Error('请使用当前服务的同源接口地址');
+      return url;
+    }
+
+    function clearAuth(message = '未登录，请先登录') {
+      token = null;
+      elements.password.value = '';
+      elements.authStatus.textContent = message;
+      elements.messages.replaceChildren();
+      elements.eventLog.textContent = '等待请求……';
+      elements.progress.textContent = '等待登录';
+      setConversationId(createConversationId());
+      setRequestActive(Boolean(abortController));
+    }
+
+    async function login(event) {
+      event.preventDefault();
+      if (loginPending || abortController) return;
+      const username = elements.username.value.trim();
+      const password = elements.password.value;
+      if (!username || !password) return;
+      loginPending = true;
+      clearAuth('正在登录……');
+      try {
+        const url = endpointUrl();
+        url.pathname = '/login';
+        url.search = '';
+        url.hash = '';
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username, password }),
+          signal: AbortSignal.timeout(15000),
+        });
+        if (!response.ok) {
+          throw new Error(response.status === 401 ? '用户名或密码错误' : `登录失败（HTTP ${response.status}）`);
+        }
+        const data = await response.json();
+        if (typeof data.token !== 'string' || !data.token) throw new Error('登录接口未返回有效 token');
+        token = data.token;
+        elements.authStatus.textContent = `已登录：${username}`;
+        elements.progress.textContent = '登录成功，可以发送问题';
+        setStatus('就绪');
+      } catch (error) {
+        elements.authStatus.textContent = error.name === 'TimeoutError' ? '登录超时，请重试' : error.message;
+        setStatus('登录失败');
+      } finally {
+        loginPending = false;
+        setRequestActive(false);
+      }
+    }
 
     function createConversationId() {
       return crypto.randomUUID();
@@ -269,7 +339,7 @@
 
     function setConversationId(value) {
       elements.conversationId.value = value;
-      localStorage.setItem('mini-agent-conversation-id', value);
+
     }
 
     function setStatus(text, streaming = false) {
@@ -323,21 +393,23 @@
     }
 
     function setRequestActive(active) {
-      for (const element of [elements.send, elements.clear, elements.newConversation,
-        elements.endpoint, elements.userId, elements.conversationId]) {
-        element.disabled = active;
+      for (const element of [elements.clear, elements.newConversation,
+        elements.endpoint, elements.conversationId, elements.username, elements.password, elements.login]) {
+        element.disabled = active || loginPending;
       }
+      elements.send.disabled = active || loginPending || !token;
+      elements.logout.disabled = active || loginPending || !token;
       elements.stop.disabled = !active;
     }
 
     async function sendMessage() {
       const question = elements.question.value.trim();
-      if (!question || abortController) return;
+      if (!question || abortController || loginPending) return;
+      if (!token) { setStatus("请先登录"); return; }
 
       const conversationId = elements.conversationId.value.trim();
-      const userId = elements.userId.value.trim();
-      if (!conversationId || !userId) {
-        setStatus('请填写用户 ID 和会话 ID');
+      if (!conversationId) {
+        setStatus('请填写会话 ID');
         return;
       }
       if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(conversationId)) {
@@ -346,7 +418,6 @@
       }
 
       setConversationId(conversationId);
-      localStorage.setItem('mini-agent-user-id', userId);
       appendMessage('user', question);
       const assistantMessage = appendMessage('assistant');
       elements.question.value = '';
@@ -387,20 +458,24 @@
       }
 
       try {
-        const response = await fetch(elements.endpoint.value.trim() || '/chat', {
+        const response = await fetch(endpointUrl(), {
           method: 'POST',
           headers: {
+            'Authorization': `Bearer ${token}`,
             'Accept': 'text/event-stream',
             'Content-Type': 'application/json',
           },
           body: JSON.stringify({
             question,
             conversation_id: conversationId,
-            user_id: userId,
           }),
           signal: abortController.signal,
         });
 
+        if (response.status === 401) {
+          clearAuth('登录已失效，请重新登录');
+          throw new Error('登录已失效，请重新登录');
+        }
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}: ${await response.text()}`);
         }
@@ -459,6 +534,8 @@
       }
     }
 
+    elements.loginForm.addEventListener('submit', login);
+    elements.logout.addEventListener('click', () => { clearAuth(); setStatus('已退出'); });
     elements.send.addEventListener('click', sendMessage);
     elements.stop.addEventListener('click', () => abortController?.abort());
     elements.question.addEventListener('keydown', event => {
@@ -486,8 +563,8 @@
       setStatus('就绪');
     });
 
-    elements.userId.value = localStorage.getItem('mini-agent-user-id') || 'debug-user';
-    setConversationId(localStorage.getItem('mini-agent-conversation-id') || createConversationId());
+    setConversationId(createConversationId());
+    setRequestActive(false);
   </script>
 </body>
 </html>

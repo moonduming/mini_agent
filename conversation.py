@@ -178,7 +178,7 @@ async def load_conversation_context(
     async with connection.cursor() as cursor:
         await cursor.execute(
             """
-            SELECT summary, COALESCE(summary_until_turn_id, 0)
+            SELECT user_id, summary, COALESCE(summary_until_turn_id, 0)
             FROM conversations
             WHERE id = %s
             """,
@@ -191,7 +191,9 @@ async def load_conversation_context(
         summary = None
         summary_until_turn_id = 0
     else:
-        summary, summary_until_turn_id = conversation_row
+        stored_user_id, summary, summary_until_turn_id = conversation_row
+        if user_id != stored_user_id:
+            raise PermissionError("无权访问此会话")
 
     async with connection.cursor() as cursor:
         # next_turn_id 必须基于完整历史计算，不能依赖未压缩消息是否为空。
