@@ -314,7 +314,15 @@ def search_knowledge_base(query: str) -> dict[str, Any]:
 
         print("知识库调用")
         return {
-            "results": [point.model_dump() for point in search_result.points]
+            "results": [
+                {
+                    "content": point.payload.get("content"),
+                    "source": point.payload.get("source"),
+                    "heading_path": point.payload.get("heading_path"),
+                    "score": point.score,
+                }
+                for point in search_result.points
+            ]
         }
     except Exception as e:
         print(f"知识库调用失败: {e}")
