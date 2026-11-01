@@ -4,7 +4,7 @@ A Python backend that helps engineers investigate OpenStack errors through natur
 
 The agent aggregates recurring errors, retrieves a few representative records when needed, and can search a documentation knowledge base to inform troubleshooting. A browser debug console exposes tool progress and streamed responses.
 
-**Portfolio focus:** LLM tool calling · LangGraph workflows · RAG · FastAPI streaming · PostgreSQL · Redis · Qdrant
+**Core technologies:** LLM tool calling · LangGraph workflows · RAG · FastAPI streaming · PostgreSQL · Redis · Qdrant
 
 ## Use case
 
@@ -169,7 +169,7 @@ uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 
 Log in with the demo account, use a conversation UUID, and ask about a date range present in your imported logs. New conversation IDs are created on the first chat request. Keep the same ID for follow-up questions; use a new UUID for a separate investigation.
 
-For a portfolio walkthrough, demonstrate an error summary, a follow-up requesting representative records, and a request for relevant documentation. The debug console shows tool progress and streamed text. Use your actual run as evidence; this repository does not include measured accuracy or latency results.
+To explore the workflow, request an error summary, inspect representative records, and retrieve relevant documentation. The debug console shows tool progress and streamed text.
 
 ## API reference
 
@@ -202,7 +202,7 @@ SSE event types are `status` (tool progress), `message` (response text chunks), 
 MINI_AGENT_CONFIG=config.example.ini python -m unittest discover -s tests -v
 ```
 
-The suite mocks external services and model calls. It covers async pool lifecycles, tool execution, SSE event flow, summary boundaries, skipped tool-call pairing, timeout/cancellation cleanup, JWT validation, conversation ownership, and matching log query time ranges. These are regression tests, not live-service integration tests or an evaluation of diagnosis quality.
+The suite mocks external services and model calls. It covers async pool lifecycles, tool execution, SSE event flow, summary boundaries, skipped tool-call pairing, timeout/cancellation cleanup, JWT validation, conversation ownership, and matching log query time ranges. These are regression tests, not live-service integration tests or an evaluation of diagnosis quality. Accuracy and latency evaluation is not yet included.
 
 ## Repository map
 
@@ -224,12 +224,13 @@ tests/                         Mock-based regression tests
 
 ## Scope and extension points
 
-This is a portfolio backend with a local debug interface. It demonstrates agent orchestration, data ingestion, retrieval, persistence, authentication, and streaming in one application.
+This backend includes a local debug interface for exploring log analysis and documentation retrieval workflows. It combines agent orchestration, data ingestion, retrieval, persistence, authentication, and streaming in one application.
 
 - Log queries currently access a shared log dataset. Conversation ownership is checked, but log access is not isolated by customer or tenant.
 - Retrieval returns source metadata to the model; answer-level citations and diagnostic correctness are not automatically verified.
 - The system suggests analysis and troubleshooting guidance; it does not execute remediation commands.
 - Additional log sources require parsers and ingestion configuration. Deployment automation, monitoring, rate limiting, and a customer-facing interface are extension work.
-- The repository does not include production deployment claims, client outcomes, performance benchmarks, or a top-level software license. Third-party datasets and documentation retain their own usage terms.
 
-For freelance project discussions, this codebase provides concrete examples of Python AI backend development, tool-calling agents, document retrieval pipelines, streamed APIs, and persistent conversational workflows.
+## License
+
+No top-level software license is currently included. Third-party datasets and documentation retain their own usage terms; see [data/DOWNLOADS.md](data/DOWNLOADS.md) for sources and attribution notes.
