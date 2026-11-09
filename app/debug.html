@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Mini Agent SSE 调试台</title>
+  <title>Mini Agent Debug Console</title>
   <style>
     :root {
       color-scheme: dark;
@@ -126,6 +126,14 @@
       border-bottom-left-radius: 4px;
     }
 
+    .message.thinking {
+      border: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .thinking summary { cursor: pointer; }
+    .thinking div { margin-top: 8px; }
+    .message-heading { display: block; margin-bottom: 6px; }
     .message.error { border-color: #7c3340; color: #ffd6da; }
     .request-progress { padding: 0 22px 14px; color: var(--muted); font-size: 13px; }
 
@@ -173,20 +181,6 @@
     aside h2 { margin: 0 0 16px; font-size: 16px; }
     label { display: block; margin: 13px 0 6px; color: var(--muted); font-size: 13px; }
 
-    .event-log {
-      height: 260px;
-      margin-top: 10px;
-      padding: 11px;
-      overflow: auto;
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      background: #080d19;
-      color: #aebbd0;
-      font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
-      white-space: pre-wrap;
-      overflow-wrap: anywhere;
-    }
-
     .hint { margin-top: 12px; color: var(--muted); font-size: 12px; line-height: 1.6; }
 
     @media (max-width: 820px) {
@@ -200,55 +194,56 @@
   <main class="page">
     <header>
       <div>
-        <h1>Mini Agent 调试台</h1>
-        <p>通过 POST 请求读取 SSE，实时查看模型输出和原始事件。</p>
+        <h1>Mini Agent Debug Console</h1>
+        <p>Follow the analysis as it runs and see the final answer separately.</p>
       </div>
-      <div id="status" class="status" role="status"><span class="dot"></span><span>就绪</span></div>
+      <div id="status" class="status" role="status"><span class="dot"></span><span>Ready</span></div>
     </header>
 
     <div class="layout">
       <section class="card chat">
         <div id="messages" class="messages">
-          <div id="empty" class="empty">先在右侧登录，再输入问题<br>响应会随着 SSE 消息实时显示</div>
+          <div class="empty">Sign in to ask a question about your logs.</div>
         </div>
-        <div id="progress" class="request-progress" role="status">等待发送请求</div>
+        <div id="progress" class="request-progress" role="status">Waiting for a question</div>
         <div class="composer">
-          <textarea id="question" aria-label="问题" placeholder="例如：分析 2017-05-15 到 2017-05-17 的 ERROR 日志"></textarea>
+          <textarea id="question" aria-label="Question" placeholder="Example: Summarize OpenStack errors from May 16 through May 17, 2017."></textarea>
           <div class="actions">
-            <button id="stop" class="danger" disabled>停止</button>
-            <button id="send" disabled>发送</button>
+            <button id="stop" class="danger" disabled>Stop receiving</button>
+            <button id="send" disabled>Send</button>
           </div>
         </div>
       </section>
 
       <aside class="card">
-        <h2>请求配置</h2>
-        <label for="endpoint">接口地址</label>
-        <input id="endpoint" value="/chat">
+        <h2>Request Settings</h2>
+        <label for="endpoint">Run Endpoint</label>
+        <input id="endpoint" value="/chat/runs">
 
         <form id="loginForm">
-          <label for="username">用户名</label>
+          <label for="username">Username</label>
           <input id="username" autocomplete="username" required>
-          <label for="password">密码</label>
+          <label for="password">Password</label>
           <input id="password" type="password" autocomplete="current-password" required>
           <div class="actions">
-            <button id="login" type="submit">登录</button>
-            <button id="logout" type="button" class="secondary" disabled>退出</button>
+            <button id="login" type="submit">Sign in</button>
+            <button id="logout" type="button" class="secondary" disabled>Sign out</button>
           </div>
         </form>
-        <div id="authStatus" class="hint" role="status">未登录。登录凭证仅保存在当前页面，刷新后需重新登录。</div>
+        <div id="authStatus" class="hint" role="status">Signed out. You will need to sign in again after refreshing this page.</div>
 
-        <label for="conversationId">会话 ID</label>
+        <label for="conversationId">Conversation ID</label>
         <input id="conversationId">
 
+        <label for="runId">Run ID</label>
+        <input id="runId" readonly>
+
         <div class="actions">
-          <button id="newConversation" class="secondary">新建会话</button>
-          <button id="clear" class="secondary">清空页面</button>
+          <button id="newConversation" class="secondary">New Conversation</button>
+          <button id="clear" class="secondary">Clear Chat</button>
         </div>
 
-        <label>原始 SSE 事件</label>
-        <div id="eventLog" class="event-log">等待请求……</div>
-        <div class="hint">快捷键：Ctrl / Cmd + Enter 发送。停止按钮只中断浏览器连接。清空页面不会删除数据库中的会话；新建会话会更换会话 ID。</div>
+        <div class="hint">Press Enter to send or Shift + Enter for a new line. The run continues in the background if you stop receiving updates. Clear Chat clears the display. New Conversation starts a separate conversation.</div>
       </aside>
     </div>
   </main>
@@ -256,7 +251,6 @@
   <script>
     const elements = {
       messages: document.querySelector('#messages'),
-      empty: document.querySelector('#empty'),
       question: document.querySelector('#question'),
       endpoint: document.querySelector('#endpoint'),
       loginForm: document.querySelector('#loginForm'),
@@ -266,7 +260,7 @@
       logout: document.querySelector('#logout'),
       authStatus: document.querySelector('#authStatus'),
       conversationId: document.querySelector('#conversationId'),
-      eventLog: document.querySelector('#eventLog'),
+      runId: document.querySelector('#runId'),
       status: document.querySelector('#status'),
       progress: document.querySelector('#progress'),
       send: document.querySelector('#send'),
@@ -280,18 +274,18 @@
     let loginPending = false;
 
     function endpointUrl() {
-      const url = new URL(elements.endpoint.value.trim() || '/chat', location.href);
-      if (url.origin !== location.origin) throw new Error('请使用当前服务的同源接口地址');
+      const url = new URL(elements.endpoint.value.trim() || '/chat/runs', location.href);
+      if (url.origin !== location.origin) throw new Error('Use an endpoint on the same origin as this page.');
       return url;
     }
 
-    function clearAuth(message = '未登录，请先登录') {
+    function clearAuth(message = 'Please sign in to continue.') {
       token = null;
       elements.password.value = '';
       elements.authStatus.textContent = message;
       elements.messages.replaceChildren();
-      elements.eventLog.textContent = '等待请求……';
-      elements.progress.textContent = '等待登录';
+      elements.runId.value = '';
+      elements.progress.textContent = 'Waiting for sign-in';
       setConversationId(createConversationId());
       setRequestActive(Boolean(abortController));
     }
@@ -303,7 +297,7 @@
       const password = elements.password.value;
       if (!username || !password) return;
       loginPending = true;
-      clearAuth('正在登录……');
+      clearAuth('Signing in…');
       try {
         const url = endpointUrl();
         url.pathname = '/login';
@@ -316,17 +310,17 @@
           signal: AbortSignal.timeout(15000),
         });
         if (!response.ok) {
-          throw new Error(response.status === 401 ? '用户名或密码错误' : `登录失败（HTTP ${response.status}）`);
+          throw new Error(response.status === 401 ? 'Incorrect username or password' : `Sign-in failed (HTTP ${response.status}).`);
         }
         const data = await response.json();
-        if (typeof data.token !== 'string' || !data.token) throw new Error('登录接口未返回有效 token');
+        if (typeof data.token !== 'string' || !data.token) throw new Error('The sign-in endpoint did not return a valid token.');
         token = data.token;
-        elements.authStatus.textContent = `已登录：${username}`;
-        elements.progress.textContent = '登录成功，可以发送问题';
-        setStatus('就绪');
+        elements.authStatus.textContent = `Signed in as ${username}`;
+        elements.progress.textContent = 'Signed in. You can now send a question.';
+        setStatus('Ready');
       } catch (error) {
-        elements.authStatus.textContent = error.name === 'TimeoutError' ? '登录超时，请重试' : error.message;
-        setStatus('登录失败');
+        elements.authStatus.textContent = error.name === 'TimeoutError' ? 'Sign-in timed out. Please try again.' : error.message;
+        setStatus('Sign-in failed');
       } finally {
         loginPending = false;
         setRequestActive(false);
@@ -347,29 +341,36 @@
       elements.status.lastElementChild.textContent = text;
     }
 
-    function appendMessage(role, text = '') {
+    function appendChatItem(item) {
       elements.messages.querySelector('.empty')?.remove();
+      elements.messages.appendChild(item);
+      elements.messages.scrollTop = elements.messages.scrollHeight;
+    }
+
+    function appendMessage(role, text, heading) {
       const message = document.createElement('div');
       message.className = `message ${role}`;
       message.textContent = text;
-      elements.messages.appendChild(message);
-      elements.messages.scrollTop = elements.messages.scrollHeight;
-      return message;
-    }
-
-    function appendEvent(eventName, data) {
-      const line = `[${new Date().toLocaleTimeString()}] ${eventName}\n${JSON.stringify(data, null, 2)}\n\n`;
-      if (elements.eventLog.textContent === '等待请求……') elements.eventLog.textContent = '';
-      elements.eventLog.textContent += line;
-      elements.eventLog.scrollTop = elements.eventLog.scrollHeight;
-    }
-
-    function contentAsText(content) {
-      if (typeof content === 'string') return content;
-      if (Array.isArray(content)) {
-        return content.map(item => typeof item === 'string' ? item : (item?.text ?? '')).join('');
+      if (heading) {
+        const title = document.createElement('strong');
+        title.className = 'message-heading';
+        title.textContent = heading;
+        message.prepend(title);
       }
-      return content?.text ?? '';
+      appendChatItem(message);
+    }
+
+    function appendThinking() {
+      const details = document.createElement('details');
+      details.className = 'message thinking';
+      details.open = true;
+      const summary = document.createElement('summary');
+      summary.textContent = 'Analysis Progress';
+      const body = document.createElement('div');
+      details.appendChild(summary);
+      details.appendChild(body);
+      appendChatItem(details);
+      return body;
     }
 
     function parseEventBlock(block) {
@@ -402,67 +403,84 @@
       elements.stop.disabled = !active;
     }
 
+    async function checkResponse(response) {
+      if (response.status === 401) {
+        clearAuth('Your session has expired. Please sign in again.');
+        throw new Error('Your session has expired. Please sign in again.');
+      }
+      if (!response.ok) {
+        const { detail } = await response.json().catch(() => ({}));
+        const message = typeof detail === 'string' ? detail : detail?.message;
+        throw new Error(message || `Request failed (HTTP ${response.status}).`);
+      }
+    }
+
     async function sendMessage() {
       const question = elements.question.value.trim();
       if (!question || abortController || loginPending) return;
-      if (!token) { setStatus("请先登录"); return; }
+      if (!token) { setStatus("Please sign in"); return; }
 
       const conversationId = elements.conversationId.value.trim();
       if (!conversationId) {
-        setStatus('请填写会话 ID');
+        setStatus('Enter a conversation ID.');
         return;
       }
       if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(conversationId)) {
-        setStatus('会话 ID 必须是有效的 UUID');
+        setStatus('The conversation ID must be a valid UUID.');
         return;
       }
 
       setConversationId(conversationId);
       appendMessage('user', question);
-      const assistantMessage = appendMessage('assistant');
+      const thinking = appendThinking();
       elements.question.value = '';
-      elements.eventLog.textContent = '';
+      elements.runId.value = '';
       setRequestActive(true);
       abortController = new AbortController();
-      setStatus('连接中', true);
-      elements.progress.textContent = '正在连接接口……';
+      setStatus('Connecting', true);
+      elements.progress.textContent = 'Creating a run…';
       let terminalEvent = null;
+      let answerDisplayed = false;
+      let failure = null;
       let reader = null;
+
+      function showAnswer(data) {
+        if (answerDisplayed) return;
+        if (typeof data?.answer !== 'string' || !data.answer.trim()) {
+          throw new Error('The server did not provide a final answer.');
+        }
+        appendMessage('assistant', data.answer, 'Final Answer');
+        answerDisplayed = true;
+      }
 
       function handleEvent(block) {
         const parsed = parseEventBlock(block);
         if (!parsed) return;
         const { eventName, data } = parsed;
-        appendEvent(eventName, data);
-        if (terminalEvent) return;
-
-        if (eventName === 'status') {
-          elements.progress.textContent = contentAsText(data);
-          setStatus('工具执行中', true);
-        } else if (eventName === 'message') {
-          assistantMessage.textContent += contentAsText(data);
+        if ((eventName === 'message' || eventName === 'status') && typeof data === 'string' && data) {
+          if (eventName === 'status') {
+            const separator = thinking.textContent && !thinking.textContent.endsWith('\n\n') ? '\n\n' : '';
+            thinking.textContent += `${separator}${data}\n\n`;
+          } else {
+            thinking.textContent += data;
+          }
           elements.messages.scrollTop = elements.messages.scrollHeight;
-          elements.progress.textContent = '正在接收回答，等待服务端完成本轮处理……';
-          setStatus('接收中', true);
-        } else if (eventName === 'error') {
-          terminalEvent = 'error';
-          const message = data?.message || contentAsText(data) || '接口执行异常';
-          appendMessage('assistant error', message);
-          elements.progress.textContent = message;
-          setStatus('执行失败');
-        } else if (eventName === 'done') {
-          terminalEvent = 'done';
-          elements.progress.textContent = '本轮处理完成';
-          setStatus('完成');
         }
+        if (eventName === 'answer') {
+          showAnswer(data);
+          elements.progress.textContent = 'Final answer received. Finishing the run…';
+        }
+        if (eventName === 'done' || eventName === 'error') terminalEvent = parsed;
       }
 
       try {
-        const response = await fetch(endpointUrl(), {
+        const url = endpointUrl();
+        const authorization = `Bearer ${token}`;
+        const created = await fetch(url, {
           method: 'POST',
           headers: {
-            'Authorization': `Bearer ${token}`,
-            'Accept': 'text/event-stream',
+            'Authorization': authorization,
+            'Accept': 'application/json',
             'Content-Type': 'application/json',
           },
           body: JSON.stringify({
@@ -471,22 +489,31 @@
           }),
           signal: abortController.signal,
         });
+        await checkResponse(created);
+        const { run_id: runId } = await created.json();
+        if (typeof runId !== 'string' ||
+            !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(runId)) {
+          throw new Error('The run endpoint did not return a valid run ID.');
+        }
+        elements.runId.value = runId;
+        url.pathname = `${url.pathname.replace(/\/$/, '')}/${runId}/events`;
+        url.hash = '';
+        elements.progress.textContent = 'Run created. Connecting to the event stream…';
 
-        if (response.status === 401) {
-          clearAuth('登录已失效，请重新登录');
-          throw new Error('登录已失效，请重新登录');
-        }
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}: ${await response.text()}`);
-        }
+        const response = await fetch(url, {
+          method: 'GET',
+          headers: { 'Authorization': authorization, 'Accept': 'text/event-stream' },
+          signal: abortController.signal,
+        });
+        await checkResponse(response);
         if (!response.headers.get('content-type')?.includes('text/event-stream')) {
-          throw new Error('接口未返回 SSE，请检查接口地址');
+          throw new Error('The endpoint did not return an event stream. Check the endpoint URL.');
         }
-        if (!response.body) throw new Error('浏览器没有收到响应流');
+        if (!response.body) throw new Error('The browser did not receive a response stream.');
 
         reader = response.body.getReader();
-        setStatus('等待响应', true);
-        elements.progress.textContent = '已连接，等待模型或工具返回……';
+        setStatus('Processing', true);
+        elements.progress.textContent = 'Processing your question…';
         const decoder = new TextDecoder();
         let buffer = '';
 
@@ -496,37 +523,42 @@
           buffer = buffer.replace(/\r\n/g, '\n');
 
           let boundary;
-          while ((boundary = buffer.indexOf('\n\n')) !== -1) {
+          while (!terminalEvent && (boundary = buffer.indexOf('\n\n')) !== -1) {
             const block = buffer.slice(0, boundary);
             buffer = buffer.slice(boundary + 2);
             handleEvent(block);
           }
 
           if (terminalEvent) {
-            await reader.cancel();
+            await reader.cancel().catch(() => {});
             break;
           }
           if (done) break;
         }
 
-        if (!terminalEvent) throw new Error('连接已结束，但未收到 done 或 error 事件，本轮可能未完成');
-        if (!assistantMessage.textContent) {
-          if (terminalEvent === 'error') assistantMessage.remove();
-          else assistantMessage.textContent = '本轮已完成，未返回文本内容';
+        if (!terminalEvent) throw new Error('The connection closed before the run status could be confirmed.');
+        const { eventName, data } = terminalEvent;
+        if (eventName === 'error') {
+          failure = data?.message || 'The run encountered an error.';
+          elements.progress.textContent = failure;
+          setStatus('Run failed');
+        } else {
+          showAnswer(data);
+          elements.progress.textContent = 'Run complete';
+          setStatus('Complete');
         }
       } catch (error) {
         if (error.name === 'AbortError') {
-          assistantMessage.textContent ||= '已停止接收';
-          elements.progress.textContent = '浏览器已停止接收，本轮服务端状态未确认';
-          setStatus('已停止');
+          elements.progress.textContent = 'The browser stopped receiving updates. The run may still be in progress.';
+          setStatus('Stopped');
         } else {
-          if (!assistantMessage.textContent) assistantMessage.remove();
-          appendMessage('assistant error', String(error));
-          elements.progress.textContent = String(error);
-          appendEvent('client_error', String(error));
-          setStatus('连接失败');
+          failure = error.message;
+          elements.progress.textContent = failure;
+          setStatus('Connection failed');
         }
       } finally {
+        if (!thinking.textContent) thinking.textContent = 'No progress updates were received for this run.';
+        if (failure) appendMessage('assistant error', failure);
         reader?.releaseLock();
         abortController = null;
         setRequestActive(false);
@@ -535,32 +567,34 @@
     }
 
     elements.loginForm.addEventListener('submit', login);
-    elements.logout.addEventListener('click', () => { clearAuth(); setStatus('已退出'); });
+    elements.logout.addEventListener('click', () => { clearAuth(); setStatus('Signed out'); });
     elements.send.addEventListener('click', sendMessage);
     elements.stop.addEventListener('click', () => abortController?.abort());
     elements.question.addEventListener('keydown', event => {
-      if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') sendMessage();
+      if (event.key !== 'Enter' || event.shiftKey || event.isComposing || event.keyCode === 229) return;
+      event.preventDefault();
+      if (!event.repeat) return sendMessage();
     });
     elements.clear.addEventListener('click', () => {
       elements.messages.replaceChildren();
+      elements.runId.value = '';
       const empty = document.createElement('div');
       empty.className = 'empty';
-      empty.textContent = '页面已清空，会话 ID 保持不变';
+      empty.textContent = 'Chat cleared. The conversation ID remains the same.';
       elements.messages.appendChild(empty);
-      elements.eventLog.textContent = '等待请求……';
-      elements.progress.textContent = '等待发送请求';
-      setStatus('就绪');
+      elements.progress.textContent = 'Waiting for a question';
+      setStatus('Ready');
     });
     elements.newConversation.addEventListener('click', () => {
       setConversationId(createConversationId());
       elements.messages.replaceChildren();
+      elements.runId.value = '';
       const empty = document.createElement('div');
       empty.className = 'empty';
-      empty.textContent = '已创建新会话';
+      empty.textContent = 'New conversation started.';
       elements.messages.appendChild(empty);
-      elements.eventLog.textContent = '等待请求……';
-      elements.progress.textContent = '等待发送请求';
-      setStatus('就绪');
+      elements.progress.textContent = 'Waiting for a question';
+      setStatus('Ready');
     });
 
     setConversationId(createConversationId());

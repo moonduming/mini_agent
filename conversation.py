@@ -218,6 +218,28 @@ async def load_conversation_context(
     )
 
 
+async def load_final_answer(connection: Any, conversation_id: UUID, turn_id: int) -> str:
+    """从当前轮次已提交的消息中读取最终回答。"""
+    async with connection.cursor() as cursor:
+        await cursor.execute(
+            """
+            SELECT message_data
+            FROM conversation_messages
+            WHERE conversation_id = %s AND turn_id = %s AND message_type = 'ai'
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (conversation_id, turn_id),
+        )
+        row = await cursor.fetchone()
+
+    if row is not None:
+        message = deserialize_message(row[0])
+        if isinstance(message, AIMessage) and not message.tool_calls and message.text.strip():
+            return str(message.text)
+    raise RuntimeError("当前轮次缺少最终回答")
+
+
 async def load_successful_turns(
     connection: Any,
     conversation_id: UUID,

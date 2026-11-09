@@ -32,7 +32,7 @@ class AgentError:
         # 默认按照未知内部异常处理
         self.code = ErrorCode.INTERNAL_ERROR
         self.status = "failed"
-        self.user_message = "执行异常，请稍后重试"
+        self.user_message = "The run failed. Please try again."
 
         self._classify()
 
@@ -41,35 +41,35 @@ class AgentError:
 
         if isinstance(self.error, PermissionError):
             self.code = ErrorCode.FORBIDDEN
-            self.user_message = "无权访问此会话，请新建会话"
+            self.user_message = "You do not have access to this conversation. Start a new conversation."
             return
 
         # asyncio.timeout() 产生的超时
         if isinstance(self.error, TimeoutError):
             self.code = ErrorCode.TIMEOUT
             self.status = "timeout"
-            self.user_message = "本次处理超时，请稍后重试"
+            self.user_message = "The run timed out. Please try again."
             return
 
         # 模型 API 请求超时
         if isinstance(self.error, openai.APITimeoutError):
             self.code = ErrorCode.MODEL_TIMEOUT
             self.status = "failed"
-            self.user_message = "模型响应超时，请稍后重试"
+            self.user_message = "The model timed out. Please try again."
             return
 
         # 模型 API 限流
         if isinstance(self.error, openai.RateLimitError):
             self.code = ErrorCode.RATE_LIMIT
             self.status = "failed"
-            self.user_message = "模型服务当前繁忙，请稍后重试"
+            self.user_message = "The model service is busy. Please try again shortly."
             return
 
         # 模型服务连接异常
         if isinstance(self.error, openai.APIConnectionError):
             self.code = ErrorCode.MODEL_UNAVAILABLE
             self.status = "failed"
-            self.user_message = "模型服务暂时不可用，请稍后重试"
+            self.user_message = "The model service is temporarily unavailable. Please try again shortly."
             return
 
         # 400 类错误。
@@ -79,7 +79,7 @@ class AgentError:
             if self._is_context_length_error():
                 self.code = ErrorCode.CONTEXT_LENGTH_EXCEEDED
                 self.status = "failed"
-                self.user_message = "当前对话上下文过长，请新建对话后重试"
+                self.user_message = "This conversation is too long. Start a new conversation."
                 return
 
     def _is_context_length_error(self) -> bool:

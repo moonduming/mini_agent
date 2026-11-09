@@ -36,7 +36,7 @@ class AuthTests(unittest.IsolatedAsyncioTestCase):
                         api.get_current_user(HTTPAuthorizationCredentials(scheme='Bearer', credentials=token))
                     self.assertEqual(raised.exception.status_code, 401)
         client = TestClient(api.app)
-        response = client.post('/chat', json={'question': 'test', 'conversation_id': str(uuid4())})
+        response = client.post('/chat/runs', json={'question': 'test', 'conversation_id': str(uuid4())})
         self.assertEqual(response.status_code, 401)
         client.close()
 

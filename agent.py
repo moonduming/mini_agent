@@ -13,6 +13,7 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 
+from chat_stream import ChatStream, OutputLimitExceeded
 from config import get_settings
 from conversation import (
     MessageInsertRecord,
@@ -20,10 +21,10 @@ from conversation import (
     format_messages_for_summary,
     insert_messages,
     load_conversation_context,
+    load_final_answer,
     load_successful_turns,
     update_turn_message_status
 )
-from database import postgres_pool, redis_pool
 from tools import build_tools
 from errors import AgentError
 
@@ -44,14 +45,16 @@ SUMMARY_SYSTEM_PROMPT = """你负责维护多轮日志分析对话的累计摘�
 
 
 TOOL_STATUS = {
-    "get_log_error_examples": "获取日志错误详情",
-    "search_knowledge_base": "搜索知识库",
-    "summarize_log_errors": "获取错误日志摘要"
+    "get_log_error_examples": "Fetch representative error logs",
+    "search_knowledge_base": "Search the knowledge base",
+    "summarize_log_errors": "Summarize log errors"
 }
 
 CHAT_TIMEOUT_SECONDS = 110
 LOCK_TTL_SECONDS = 120
 CLEANUP_TIMEOUT_SECONDS = 4
+CHAT_RUN_TTL_SECONDS = CHAT_TIMEOUT_SECONDS + 2 * CLEANUP_TIMEOUT_SECONDS + 10
+OUTPUT_LIMIT_ERROR = {"code": "output_limit", "message": "This run exceeded the output limit. Narrow your question and try again."}
 
 settings = get_settings()
 model = ChatOpenAI(
@@ -223,10 +226,11 @@ def build_agent(pool: AsyncConnectionPool) -> CompiledStateGraph:
     return graph.compile()
 
 
-async def chat(
+async def run_agent(
     question: str,
     conversation_id: UUID,
     user_id: str,
+    stream: ChatStream,
     *,
     redis_client: Redis,
     pool: AsyncConnectionPool,
@@ -237,6 +241,8 @@ async def chat(
     lock_token = uuid4().hex
     turn_id = None
     answer_succeeded = False
+    terminal_event = "done"
+    terminal_data = {}
 
     async def mark_failure(status: str, message: str):
         if turn_id is None or answer_succeeded:
@@ -257,7 +263,8 @@ async def chat(
                 lock_key, lock_token, nx=True, ex=LOCK_TTL_SECONDS,
             )
             if not acquired:
-                yield "error", {"message": "当前对话正在处理中，请稍后重试"}
+                terminal_event = "error"
+                terminal_data = {"code": "conversation_busy", "message": "This conversation already has a run in progress. Please try again shortly."}
                 return
             async with pool.connection() as connection:
                 context = await load_conversation_context(connection, conversation_id, user_id)
@@ -276,18 +283,23 @@ async def chat(
                 event_type = event["event"]
                 name = event["name"]
                 if event_type == "on_tool_start":
-                    yield "status", f"执行工具{TOOL_STATUS.get(name)}"
+                    await stream.append("status", f"Running tool: {TOOL_STATUS.get(name, name)}")
                 elif event_type == "on_tool_end":
-                    yield "status", f"{TOOL_STATUS.get(name)}执行完成"
+                    await stream.append("status", f"Tool finished: {TOOL_STATUS.get(name, name)}")
                 elif event_type == "on_chat_model_stream":
-                    chunk = event["data"]["chunk"]
-                    if chunk.content:
-                        yield "message", chunk.content
+                    text = event["data"]["chunk"].text
+                    if text:
+                        await stream.append("message", text)
 
+            async with pool.connection() as connection:
+                answer = await load_final_answer(connection, conversation_id, turn_id)
             await update_turn_message_status(
                 conversation_id=conversation_id, turn_id=turn_id, status="success", pool=pool,
             )
+            terminal_data = {"answer": answer}
             answer_succeeded = True
+            # 先交付已落库的答案，摘要维护仍在当前会话锁内执行。
+            await stream.append("answer", terminal_data)
             # 从成功历史读取真实轮次；模型生成摘要期间不占数据库连接。
             try:
                 async with pool.connection() as connection:
@@ -303,19 +315,23 @@ async def chat(
                 )
             except Exception as summary_error:
                 print(f"摘要更新失败，保留旧摘要: {summary_error}")
-        yield "done", {}
+
     except asyncio.CancelledError:
+        if not answer_succeeded:
+            terminal_event = "error"
+            terminal_data = {"code": "cancelled", "message": "The run was cancelled."}
         await mark_failure("cancelled", "请求已取消")
         raise
     except Exception as e:
         print(f"agent执行异常: {e}")
-        if answer_succeeded:
-            # 回答已完成落库；摘要维护耗尽剩余时间不会使回答变成失败。
-            yield "done", {}
-        else:
+        # 回答已完成落库；摘要维护耗尽剩余时间不会使回答变成失败。
+        if not answer_succeeded:
             error = AgentError(e)
-            await mark_failure(error.status, str(e))
-            yield "error", {"code": error.code, "message": error.user_message}
+            terminal_event = "error"
+            terminal_data = {"code": error.code, "message": error.user_message}
+            if isinstance(e, OutputLimitExceeded):
+                terminal_data = OUTPUT_LIMIT_ERROR
+            await mark_failure(error.status, str(e) or terminal_data["message"])
     finally:
         release_script = """
         if redis.call("get", KEYS[1]) == ARGV[1] then
@@ -331,20 +347,12 @@ async def chat(
             except Exception as e:
                 print(f"释放锁失败{conversation_id}: {e}")
 
-
-async def main():
-    async with postgres_pool() as pool, redis_pool() as redis_client:
-        graph = build_agent(pool)
-        async for data in chat(
-            "你不是deepseek v4吗？",
-            UUID("9b3595d0-8a2d-4d5b-b89e-6e402beedd02"),
-            "akb48",
-            redis_client=redis_client,
-            pool=pool,
-            graph=graph,
-        ):
-            print(data, end="", flush=True)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+        try:
+            async with asyncio.timeout(CLEANUP_TIMEOUT_SECONDS):
+                ttl = settings.redis.chat_result_ttl_seconds
+                try:
+                    await stream.append(terminal_event, terminal_data, ttl=ttl)
+                except OutputLimitExceeded:
+                    await stream.append("error", OUTPUT_LIMIT_ERROR, ttl=ttl)
+        except Exception as e:
+            print(f"写入任务结束事件失败 {stream.key}: {e}")

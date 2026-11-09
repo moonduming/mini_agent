@@ -182,29 +182,50 @@ class AsyncRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pool.borrowed, 0)
         summary.assert_not_awaited()
 
-    async def test_chat_keeps_stream_contract_with_injected_resources(self):
+    async def test_chat_writes_only_text_and_keeps_stream_contract(self):
         pool = TrackingPool()
+        pool.cursor.fetchone = AsyncMock(return_value=(AIMessage(content='数据库中的最终回答').model_dump(),))
         context = conversation.ConversationContext(None, 0, 1, [])
         graph = MagicMock()
+        conversation_id = uuid4()
 
         async def events(*args, **kwargs):
             self.assertEqual(pool.active, 0)
             yield {'event': 'on_chat_model_stream', 'name': 'model',
-                   'data': {'chunk': AIMessage(content='回答')}}
+                   'data': {'chunk': AIMessage(content=[
+                       {'type': 'reasoning', 'reasoning': '中间推理'},
+                       {'type': 'text', 'text': '回答'},
+                   ])}}
             yield {'event': 'on_chain_end', 'name': 'graph', 'parent_ids': [],
                    'data': {'output': {'messages': []}}}
 
         graph.astream_events = events
+        stream = SimpleNamespace(append=AsyncMock())
+        events_at_summary = []
+
+        async def compress_summary(**kwargs):
+            events_at_summary.extend(call.args[0] for call in stream.append.await_args_list)
+
         with patch.object(agent, 'load_conversation_context', new=AsyncMock(return_value=context)), patch.object(
             agent, 'insert_messages', new=AsyncMock()
         ), patch.object(agent, 'update_turn_message_status', new=AsyncMock()), patch.object(
             agent, 'load_successful_turns', new=AsyncMock(return_value=[])
-        ), patch.object(agent, 'compress_conversation_context', new=AsyncMock()) as compress:
-            result = [event async for event in agent.chat(
-                '问题', uuid4(), 'user', pool=pool, graph=graph,
+        ), patch.object(agent, 'compress_conversation_context', new=AsyncMock(side_effect=compress_summary)) as compress:
+            await agent.run_agent(
+                '问题', conversation_id, 'user', stream, pool=pool, graph=graph,
                 redis_client=SimpleNamespace(set=AsyncMock(return_value=True), eval=AsyncMock(return_value=1)),
-            )]
-        self.assertEqual(result, [('message', '回答'), ('done', {})])
+            )
+        self.assertEqual([call.args for call in stream.append.await_args_list], [
+            ('message', '回答'),
+            ('answer', {'answer': '数据库中的最终回答'}),
+            ('done', {'answer': '数据库中的最终回答'}),
+        ])
+        self.assertEqual(events_at_summary, ['message', 'answer'])
+        sql, params = pool.cursor.execute.await_args.args
+        self.assertEqual(params, (conversation_id, 1))
+        self.assertIn("message_type = 'ai'", sql)
+        self.assertIn('ORDER BY id DESC', sql)
+        self.assertEqual(stream.append.await_args.kwargs['ttl'], agent.settings.redis.chat_result_ttl_seconds)
         self.assertIs(compress.await_args.kwargs['pool'], pool)
         self.assertEqual(pool.active, 0)
 

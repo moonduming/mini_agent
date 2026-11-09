@@ -10,6 +10,15 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 
 class BoundaryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_tool_call_without_final_answer_is_rejected(self):
+        pool = TrackingPool()
+        message = AIMessage(content='先查询工具', tool_calls=[
+            {'name': 'get_log_error_examples', 'args': {}, 'id': 'call-1'},
+        ])
+        pool.cursor.fetchone = AsyncMock(return_value=(message.model_dump(),))
+        with self.assertRaisesRegex(RuntimeError, '缺少最终回答'):
+            await conversation.load_final_answer(pool.conn, uuid4(), 1)
+
     async def test_load_turns_keeps_ids_out_of_model_messages(self):
         pool = TrackingPool()
         pool.cursor.fetchall.return_value = [
@@ -92,10 +101,11 @@ class BoundaryTests(unittest.IsolatedAsyncioTestCase):
             check_pairs(bound.ainvoke.await_args.args[0])
 
     async def test_request_budget_covers_each_phase(self):
-        for phase in ['load', 'insert', 'graph', 'status', 'reload', 'summary']:
+        for phase in ['load', 'insert', 'graph', 'answer', 'status', 'reload', 'summary']:
             with self.subTest(phase=phase):
                 pool = TrackingPool()
                 redis = SimpleNamespace(set=AsyncMock(return_value=True), eval=AsyncMock(return_value=1))
+                stream = SimpleNamespace(append=AsyncMock())
                 context = conversation.ConversationContext(None, 0, 1, [])
 
                 async def blocked(*args, **kwargs):
@@ -113,22 +123,25 @@ class BoundaryTests(unittest.IsolatedAsyncioTestCase):
                 with patch.object(agent, 'CHAT_TIMEOUT_SECONDS', .03), patch.object(
                     agent, 'load_conversation_context', new=AsyncMock(side_effect=blocked if phase == 'load' else None, return_value=context)
                 ), patch.object(agent, 'insert_messages', new=AsyncMock(side_effect=blocked if phase == 'insert' else None)), patch.object(
+                    agent, 'load_final_answer', new=AsyncMock(side_effect=blocked if phase == 'answer' else None, return_value='最终回答')
+                ), patch.object(
                     agent, 'update_turn_message_status', new=AsyncMock(side_effect=status)
                 ) as mark, patch.object(
                     agent, 'load_successful_turns', new=AsyncMock(side_effect=blocked if phase == 'reload' else None, return_value=[])
                 ), patch.object(
                     agent, 'compress_conversation_context', new=AsyncMock(side_effect=blocked if phase == 'summary' else None)
                 ):
-                    result = [e async for e in agent.chat(
-                        '问题', uuid4(), 'user', redis_client=redis, pool=pool,
+                    await agent.run_agent(
+                        '问题', uuid4(), 'user', stream, redis_client=redis, pool=pool,
                         graph=SimpleNamespace(astream_events=events),
-                    )]
+                    )
+                result = stream.append.await_args.args
                 if phase in ['reload', 'summary']:
-                    self.assertEqual(result[-1], ('done', {}))
+                    self.assertEqual(result, ('done', {'answer': '最终回答'}))
                     self.assertEqual([c.kwargs['status'] for c in mark.await_args_list], ['success'])
                 else:
-                    self.assertEqual(result[-1][0], 'error')
-                    self.assertEqual(result[-1][1]['code'], 'timeout')
+                    self.assertEqual(result[0], 'error')
+                    self.assertEqual(result[1]['code'], 'timeout')
                     if phase != 'load':
                         self.assertEqual(mark.await_args_list[-1].kwargs['status'], 'timeout')
                 redis.eval.assert_awaited_once()
@@ -136,31 +149,31 @@ class BoundaryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_failure_before_turn_assignment_returns_error(self):
         redis = SimpleNamespace(set=AsyncMock(side_effect=RuntimeError('redis down')), eval=AsyncMock())
-        result = [e async for e in agent.chat('问题', uuid4(), 'user',
-                  redis_client=redis, pool=TrackingPool(), graph=None)]
-        self.assertEqual(result[-1][0], 'error')
+        stream = SimpleNamespace(append=AsyncMock())
+        await agent.run_agent('问题', uuid4(), 'user', stream,
+                              redis_client=redis, pool=TrackingPool(), graph=None)
+        self.assertEqual(stream.append.await_args.args[0], 'error')
         redis.eval.assert_not_awaited()
 
     async def test_cancellation_marks_turn_and_releases_lock(self):
         entered = asyncio.Event()
         redis = SimpleNamespace(set=AsyncMock(return_value=True), eval=AsyncMock(return_value=1))
+        stream = SimpleNamespace(append=AsyncMock())
 
         async def events(*args, **kwargs):
             entered.set()
             await asyncio.Event().wait()
             yield {}
 
-        async def consume():
-            return [e async for e in agent.chat('问题', uuid4(), 'user',
-                    redis_client=redis, pool=TrackingPool(), graph=SimpleNamespace(astream_events=events))]
-
         with patch.object(agent, 'load_conversation_context', new=AsyncMock(return_value=conversation.ConversationContext(None, 0, 1, []))), patch.object(
             agent, 'insert_messages', new=AsyncMock()
         ), patch.object(agent, 'update_turn_message_status', new=AsyncMock()) as mark:
-            task = asyncio.create_task(consume())
+            task = asyncio.create_task(agent.run_agent('问题', uuid4(), 'user', stream,
+                redis_client=redis, pool=TrackingPool(), graph=SimpleNamespace(astream_events=events)))
             await asyncio.wait_for(entered.wait(), 1)
             task.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await task
         self.assertEqual(mark.await_args.kwargs['status'], 'cancelled')
+        self.assertEqual(stream.append.await_args.args[1]['code'], 'cancelled')
         redis.eval.assert_awaited_once()

@@ -29,6 +29,8 @@ class RedisSettings:
     host: str
     port: int
     db: int
+    chat_result_ttl_seconds: int = 300
+    max_active_chat_runs: int = 32
 
 
 @dataclass(frozen=True)
@@ -82,6 +84,8 @@ def get_settings() -> Settings:
                 host=parser.get("redis", "host"),
                 port=parser.getint("redis", "port"),
                 db=parser.getint("redis", "db"),
+                chat_result_ttl_seconds=parser.getint("redis", "chat_result_ttl_seconds", fallback=300),
+                max_active_chat_runs=parser.getint("redis", "max_active_chat_runs", fallback=32),
             ),
             postgres=PostgresSettings(
                 host=parser.get("postgres", "host"),
@@ -102,4 +106,6 @@ def get_settings() -> Settings:
 
     if not settings.llm.api_key.strip():
         raise RuntimeError(f"配置文件中的 llm.api_key 不能为空：{config_path}")
+    if settings.redis.chat_result_ttl_seconds < 1 or settings.redis.max_active_chat_runs < 1:
+        raise RuntimeError(f"Redis 聊天保留秒数和运行并发上限必须为正整数：{config_path}")
     return settings

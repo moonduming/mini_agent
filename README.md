@@ -2,7 +2,7 @@
 
 A Python backend that helps engineers investigate OpenStack errors through natural-language questions, structured log queries, and retrieval from operational documentation.
 
-The agent aggregates recurring errors, retrieves a few representative records when needed, and can search a documentation knowledge base to inform troubleshooting. A browser debug console exposes tool progress and streamed responses.
+The agent aggregates recurring errors, retrieves a few representative records when needed, and can search a documentation knowledge base to inform troubleshooting. A browser debug console shows the final answer and a collapsible record of intermediate output.
 
 **Core technologies:** LLM tool calling · LangGraph workflows · RAG · FastAPI streaming · PostgreSQL · Redis · Qdrant
 
@@ -18,7 +18,7 @@ Example questions for an imported dataset:
 >
 > Search the knowledge base for troubleshooting guidance related to this error.
 
-These are example prompts, not recorded results. Answers depend on the imported logs, indexed documents, and configured model. The agent's built-in instructions and debug interface currently use Chinese; English prompts depend on the selected model's language support.
+These are example prompts, not recorded results. Answers depend on the imported logs, indexed documents, and configured model. The debug interface is in English. Response language depends on the prompt and the selected model.
 
 ## Implemented capabilities
 
@@ -28,7 +28,7 @@ These are example prompts, not recorded results. Answers depend on the imported 
 | Error aggregation | PostgreSQL grouping by normalized SHA-256 error fingerprints | Summarize recurring errors before retrieving raw records |
 | Targeted evidence | Retrieve up to 3 records for a selected fingerprint and time range | Inspect examples while limiting context size |
 | Documentation retrieval | Embeddings and Qdrant similarity search | Return relevant document content, source paths, headings, and scores |
-| Streaming API | FastAPI Server-Sent Events (SSE) | Show tool status and response text as work progresses |
+| Streaming API | FastAPI Server-Sent Events (SSE) | Deliver intermediate output and the persisted final answer |
 | Conversation persistence | PostgreSQL JSONB message records and turn statuses | Restore successful conversation history and retain tool interactions |
 | Context compression | Cumulative summaries plus recent complete turns | Keep longer conversations within a configurable context budget |
 | Authentication | JWT bearer tokens and Argon2 password verification | Authenticate chat requests and check conversation ownership |
@@ -41,7 +41,7 @@ These are example prompts, not recorded results. Answers depend on the imported 
 flowchart LR
     UI[Browser debug console / API client] --> API[FastAPI: JWT + SSE]
     API --> Agent[LangGraph agent]
-    API --> Redis[(Redis: conversation locks)]
+    API --> Redis[(Redis: chat streams and conversation locks)]
     Agent <--> LLM[OpenAI-compatible chat API]
     Agent <--> History[(PostgreSQL: conversation history)]
     Agent --> Tools[Log query and retrieval tools]
@@ -169,14 +169,15 @@ uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 
 Log in with the demo account, use a conversation UUID, and ask about a date range present in your imported logs. New conversation IDs are created on the first chat request. Keep the same ID for follow-up questions; use a new UUID for a separate investigation.
 
-To explore the workflow, request an error summary, inspect representative records, and retrieve relevant documentation. The debug console shows tool progress and streamed text.
+To explore the workflow, request an error summary, inspect representative records, and retrieve relevant documentation. The debug console updates intermediate output as it arrives and displays the final answer separately as soon as it is available.
 
 ## API reference
 
 | Method | Route | Purpose |
 | --- | --- | --- |
 | `POST` | `/login` | Verify username/password and return an 8-hour JWT as `token` |
-| `POST` | `/chat` | Accept a question and conversation UUID; stream SSE events; requires a bearer token |
+| `POST` | `/chat/runs` | Accept a question and conversation UUID and return HTTP 202 with a `run_id` |
+| `GET` | `/chat/runs/{run_id}/events` | Replay saved events and stream live updates for the run owner |
 | `GET` | `/debug` | Open the browser debug console |
 
 Login request:
@@ -194,7 +195,11 @@ Chat request with `Authorization: Bearer <token>`:
 }
 ```
 
-SSE event types are `status` (tool progress), `message` (response text chunks), `done` (completion), and `error` (failure). Clients should handle authentication/validation HTTP errors before reading the stream, and `error` events after streaming begins. Use a streaming POST client such as browser `fetch`; native `EventSource` does not support this POST body and authorization-header pattern.
+Send the bearer token on both requests. Use streaming `fetch` for the GET request to include the authorization header. SSE sends intermediate tool status and model text as JSON strings in `status` and `message` events. Once the final answer has been read from the current PostgreSQL turn, the server publishes a Redis-backed `answer` event as `{"answer":"..."}`. The terminal `done` event carries the same payload. An `error` event contains `code` and `message`. The connection closes after `done` or `error`. During idle periods the server sends SSE comments.
+
+To resume an interrupted connection, pass the last processed SSE ID in the `Last-Event-ID` header for the same run. An already processed terminal ID returns HTTP 204. A missing, expired, or inaccessible run returns HTTP 404. If the run disappears during streaming, the server sends a terminal `run_unavailable` error.
+
+Redis sets a 128-second expiry when a run is created. Publishing a terminal event starts the result retention window, which defaults to 300 seconds and is controlled by `[redis] chat_result_ttl_seconds`. A run accepts up to 8,192 intermediate events and 512 KiB of serialized intermediate payloads. The `answer` and `done` events can each carry up to 512 KiB. Crossing a limit ends the stream with `output_limit` while preserving earlier events for replay. Each app process admits up to `[redis] max_active_chat_runs` active runs (default 32) and returns HTTP 429 at capacity. Conversation history is stored in PostgreSQL.
 
 ## Tests
 
